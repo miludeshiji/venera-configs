@@ -30,6 +30,10 @@ class LightNovelShelf extends ComicSource {
   _sessionToken = "";
   _sessionTokenAt = 0;
 
+  // 每日签到状态：成功日期持久化，尝试日期只作用于当前 JS 实例。
+  _signInInProgress = false;
+  _autoSignInAttemptDate = "";
+
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
   }
@@ -146,6 +150,96 @@ class LightNovelShelf extends ComicSource {
       text.includes("未授权") ||
       text.includes("未登录")
     );
+  }
+
+  _utcDate() {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  _isAlreadySignedError(error) {
+    const text = String(error && error.message ? error.message : error)
+      .toLowerCase();
+    return (
+      text.includes("已签到") ||
+      text.includes("已经签到") ||
+      text.includes("already signed") ||
+      text.includes("already checked in")
+    );
+  }
+
+  async _performDailySignIn() {
+    const authSnapshot = this.loadData("refreshToken");
+    this._signInInProgress = true;
+
+    try {
+      const data = await this._hubCall("SignIn", {});
+      const streak = Number(this._value(data, "streak", "Streak", NaN));
+      const reward = Number(this._value(data, "reward", "Reward", NaN));
+      const coinReward = Number(
+        this._value(data, "coinReward", "CoinReward", NaN),
+      );
+
+      if (
+        !Number.isFinite(streak) ||
+        !Number.isFinite(reward) ||
+        !Number.isFinite(coinReward)
+      ) {
+        throw new Error("签到响应格式异常");
+      }
+
+      // 请求期间若退出或切换账号，不记录旧账号的结果。
+      if (this.loadData("refreshToken") !== authSnapshot) {
+        return null;
+      }
+
+      this.saveData("lastSignInUtcDate", this._utcDate());
+      return {
+        streak: streak,
+        reward: reward,
+        coinReward: coinReward,
+      };
+    } finally {
+      this._signInInProgress = false;
+    }
+  }
+
+  async dailySignIn(isTask = false) {
+    const automatic = !!isTask;
+    const today = this._utcDate();
+
+    if (!this.isLogged) {
+      if (!automatic) UI.showMessage("请先登录轻书架账号");
+      return null;
+    }
+
+    if (this.loadData("lastSignInUtcDate") === today) {
+      if (!automatic) UI.showMessage("今日已签到");
+      return null;
+    }
+
+    if (this._signInInProgress) {
+      if (!automatic) UI.showMessage("签到正在进行中");
+      return null;
+    }
+
+    try {
+      const result = await this._performDailySignIn();
+      if (!result) return null;
+
+      UI.showMessage(
+        `签到成功：连续 ${result.streak} 天，经验 +${result.reward}，金币 +${result.coinReward}`,
+      );
+      return result;
+    } catch (error) {
+      if (!automatic) {
+        UI.showMessage(
+          this._isAlreadySignedError(error)
+            ? "今日已签到"
+            : "签到失败，请稍后重试",
+        );
+      }
+      return null;
+    }
   }
 
   _getVisitorId() {
