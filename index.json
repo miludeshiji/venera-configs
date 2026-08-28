@@ -201,5 +201,12 @@
         "key": "mycomic",
         "version": "1.1.0",
         "description": "mycomic.com漫画源, 遇到Cloudflare验证请在源设置中登录"
+    },
+    {
+        "name": "轻书架",
+        "fileName": "lightnovelshelf.js",
+        "key": "LightNovelShelf",
+        "version": "0.2.3",
+        "description": "轻书架漫画源，使用前需配置 RefreshToken 和 x-id / Visitor ID"
     }
 ]
