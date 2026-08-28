@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.7
+ * 版本：0.2.8
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -9,6 +9,7 @@
  * - 邮箱密码登录并自动管理认证令牌
  * - RefreshToken -> session Token 自动刷新
  * - SignalR Bearer Token 认证
+ * - 每日自动/手动签到
  * - Long Polling 防缓存参数
  * - 漫画列表 / 搜索 / 详情 / 章节 / 正文图片
  *
@@ -20,7 +21,7 @@
 class LightNovelShelf extends ComicSource {
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.7";
+  version = "0.2.8";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -1320,6 +1321,19 @@ class LightNovelShelf extends ComicSource {
       title: "搜索时忽略 AI 内容",
       type: "switch",
       default: false,
+    },
+
+    dailySignInTask: {
+      title: "每日自动签到",
+      type: "switch",
+      default: false,
+    },
+
+    dailySignIn: {
+      title: "手动签到",
+      type: "callback",
+      buttonText: "签到",
+      callback: () => this.dailySignIn(false),
     },
   };
 }

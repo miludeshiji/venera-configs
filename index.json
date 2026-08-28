@@ -206,7 +206,7 @@
         "name": "轻书架",
         "fileName": "lightnovelshelf.js",
         "key": "LightNovelShelf",
-        "version": "0.2.7",
-        "description": "轻书架漫画源，支持在 Venera 中使用邮箱和密码登录"
+        "version": "0.2.8",
+        "description": "轻书架漫画源，支持邮箱密码登录及每日自动/手动签到"
     }
 ]
