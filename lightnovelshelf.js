@@ -1003,7 +1003,7 @@ class LightNovelShelf extends ComicSource {
   async _loadComicList(order, page) {
     const data = await this._hubCall("GetComicList", {
       Page: page,
-      Size: 20,
+      Size: LightNovelShelf.discoveryPageSize,
       Order: order,
     });
 
@@ -1104,27 +1104,80 @@ class LightNovelShelf extends ComicSource {
 
   explore = [
     {
-      title: "最近更新",
-      type: "multiPageComicList",
-      load: async (page) => {
-        return await this._loadComicList("latest", page);
-      },
-    },
-    {
-      title: "热门漫画",
-      type: "multiPageComicList",
-      load: async (page) => {
-        return await this._loadComicList("view", page);
-      },
-    },
-    {
-      title: "最新收录",
-      type: "multiPageComicList",
-      load: async (page) => {
-        return await this._loadComicList("new", page);
+      title: "轻书架",
+      type: "multiPartPage",
+      load: async () => {
+        const latest = await this._loadComicList("latest", 1);
+        const popular = await this._loadComicList("view", 1);
+        const history = await this._loadReadingHistory(1);
+
+        return [
+          {
+            title: "最近更新",
+            comics: latest.comics,
+            viewMore: {
+              page: "category",
+              attributes: {
+                category: "最近更新",
+                param: "latest",
+              },
+            },
+          },
+          {
+            title: "热门漫画",
+            comics: popular.comics,
+            viewMore: {
+              page: "category",
+              attributes: {
+                category: "热门漫画",
+                param: "view",
+              },
+            },
+          },
+          {
+            title: "阅读历史",
+            comics: history.comics,
+            viewMore: {
+              page: "category",
+              attributes: {
+                category: "阅读历史",
+                param: "history",
+              },
+            },
+          },
+        ];
       },
     },
   ];
+
+  category = {
+    title: "轻书架",
+    parts: [
+      {
+        name: "分类",
+        type: "fixed",
+        categories: ["最近更新", "热门漫画", "阅读历史"],
+        itemType: "category",
+        categoryParams: ["latest", "view", "history"],
+      },
+    ],
+  };
+
+  categoryComics = {
+    load: async (category, param, options, page) => {
+      if (param === "latest") {
+        return await this._loadComicList("latest", page);
+      }
+      if (param === "view") {
+        return await this._loadComicList("view", page);
+      }
+      if (param === "history") {
+        return await this._loadReadingHistory(page);
+      }
+
+      throw new Error(`不支持的轻书架分类: ${category}`);
+    },
+  };
 
   search = {
     load: async (keyword, options, page) => {
