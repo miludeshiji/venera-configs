@@ -120,10 +120,10 @@ Expected: PASS，退出码为 0。若失败，立即停止，不能覆盖非换�
 Run:
 
 ```bash
+git show HEAD:index.json > index.json
 node.exe <<'NODE'
 const fs = require("fs");
-const { execFileSync } = require("child_process");
-const tracked = execFileSync("git", ["show", "HEAD:index.json"], { encoding: "utf8" });
+const tracked = fs.readFileSync("index.json", "utf8");
 const closing = "\n]\n";
 if (!tracked.endsWith(closing)) throw new Error("Unexpected index.json ending");
 const entry = `    {
@@ -231,7 +231,12 @@ Expected: PASS，输出 `Source and index metadata are consistent.`。
 Run:
 
 ```bash
-node.exe scripts/validate-pr-versions.js HEAD^
+GIT_DIR_WIN="$(wslpath -w "$(git rev-parse --git-dir)")"
+WORK_TREE_WIN="$(wslpath -w "$PWD")"
+WSLENV="GIT_DIR:GIT_WORK_TREE${WSLENV:+:$WSLENV}" \
+  GIT_DIR="$GIT_DIR_WIN" \
+  GIT_WORK_TREE="$WORK_TREE_WIN" \
+  node.exe scripts/validate-pr-versions.js HEAD^
 ```
 
 Expected: PASS，输出 `Version validation passed for 1 config file(s).`。
@@ -241,12 +246,13 @@ Expected: PASS，输出 `Version validation passed for 1 config file(s).`。
 Run:
 
 ```bash
+REPO_ROOT="$PWD"
 VALIDATOR_DIR="$(mktemp -d /mnt/f/workspace/venera-cli.XXXXXX)"
 git clone --depth 1 https://github.com/venera-app/venera_cli.git "$VALIDATOR_DIR"
 (
   cd "$VALIDATOR_DIR"
   /mnt/f/flutter-env/flutter/bin/cache/dart-sdk/bin/dart.exe pub get
-  SOURCE_WIN="$(wslpath -w "$OLDPWD/lightnovelshelf.js")"
+  SOURCE_WIN="$(wslpath -w "$REPO_ROOT/lightnovelshelf.js")"
   /mnt/f/flutter-env/flutter/bin/cache/dart-sdk/bin/dart.exe run bin/venera.dart source validate "$SOURCE_WIN"
 )
 rm -rf "$VALIDATOR_DIR"
