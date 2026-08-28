@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.5
+ * 版本：0.2.6
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -20,7 +20,7 @@
 class LightNovelShelf extends ComicSource {
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.5";
+  version = "0.2.6";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -667,9 +667,22 @@ class LightNovelShelf extends ComicSource {
 
   search = {
     load: async (keyword, options, page) => {
+      const supportedModes = [
+        "fuzzy",
+        "exact",
+        "title",
+        "author",
+        "name",
+        "tags",
+      ];
+      const selectedMode = Array.isArray(options) ? options[0] : null;
+      const mode = supportedModes.includes(selectedMode)
+        ? selectedMode
+        : "fuzzy";
+
       const data = await this._hubCall("SearchComicSeries", {
         KeyWords: keyword,
-        Mode: "fuzzy",
+        Mode: mode,
         Page: page,
         Size: 20,
         IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
@@ -686,7 +699,20 @@ class LightNovelShelf extends ComicSource {
         maxPage: Number(totalPages || 1),
       };
     },
-    optionList: [],
+    optionList: [
+      {
+        type: "select",
+        label: "搜索类型",
+        options: [
+          "fuzzy-模糊搜索",
+          "exact-精确搜索",
+          "title-书名",
+          "author-作者",
+          "name-系列名",
+          "tags-标签",
+        ],
+      },
+    ],
   };
 
   comic = {
@@ -994,12 +1020,20 @@ class LightNovelShelf extends ComicSource {
     },
 
     // 详情页标签点击行为。
-    // 作者和普通标签均直接跳转到轻书架搜索。
+    // 新版 Venera 自动选中对应搜索类型；旧式字段用于兼容旧版跳转。
     onClickTag: (namespace, tag) => {
       if (namespace === "作者" || namespace === "标签") {
+        const keyword = String(tag);
+        const mode = namespace === "作者" ? "author" : "tags";
+
         return {
+          page: "search",
+          attributes: {
+            text: keyword,
+            options: [mode],
+          },
           action: "search",
-          keyword: String(tag),
+          keyword: keyword,
           param: null,
         };
       }
