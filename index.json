@@ -206,7 +206,7 @@
         "name": "轻书架",
         "fileName": "lightnovelshelf.js",
         "key": "LightNovelShelf",
-        "version": "0.2.4",
+        "version": "0.2.5",
         "description": "轻书架漫画源，使用前需配置 RefreshToken 和 x-id / Visitor ID"
     }
 ]

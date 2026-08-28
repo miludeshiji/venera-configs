@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.4
+ * 版本：0.2.5
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -20,7 +20,7 @@
 class LightNovelShelf extends ComicSource {
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.4";
+  version = "0.2.5";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -416,31 +416,96 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
+  _unwrapHubResult(target, envelope) {
+    // 轻书架目前的 Hub JSON 使用 camelCase：{ response: ... }。
+    // 旧实现/其他线路可能仍返回 PascalCase：
+    // { Success, Response, Status, Msg }。
+    if (envelope && typeof envelope === "object") {
+      const hasSuccess =
+        Object.prototype.hasOwnProperty.call(envelope, "Success") ||
+        Object.prototype.hasOwnProperty.call(envelope, "success");
+
+      if (hasSuccess) {
+        const success =
+          envelope.Success !== undefined
+            ? envelope.Success
+            : envelope.success;
+
+        if (!success) {
+          const status =
+            envelope.Status !== undefined
+              ? envelope.Status
+              : envelope.status;
+          const msg =
+            envelope.Msg !== undefined ? envelope.Msg : envelope.msg;
+
+          throw `${target} 失败${
+            status !== undefined ? ` [${status}]` : ""
+          }: ${msg || "Unknown error"}`;
+        }
+      }
+
+      if (Object.prototype.hasOwnProperty.call(envelope, "response")) {
+        return envelope.response;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(envelope, "Response")) {
+        return envelope.Response;
+      }
+    }
+
+    return envelope;
+  }
+
   /**
-   * 在已建立的 SignalR 会话中调用 Hub Method。
+   * 在已建立的 SignalR 会话中调用单个 Hub Method。
    */
   async _hubInvoke(session, target, params) {
-    const invocationId = String(++session.seq);
+    const results = await this._hubInvokeMany(session, target, [params]);
+    return results[0];
+  }
 
-    const message =
-      JSON.stringify({
-        type: 1,
-        invocationId: invocationId,
-        target: target,
-        // 官方 Web 默认 UseGzip=true；这里关闭 gzip，直接让服务端返回 JSON 对象。
-        arguments: [params, { UseGzip: false }],
-      }) + "\x1e";
+  /**
+   * 在同一个 SignalR transport payload 中批量发送多个 Invocation，
+   * 再按 invocationId 收集可能乱序到达的 Completion。
+   */
+  async _hubInvokeMany(session, target, paramsList) {
+    if (!Array.isArray(paramsList) || paramsList.length === 0) {
+      return [];
+    }
+
+    const invocations = paramsList.map((params, index) => {
+      const invocationId = String(++session.seq);
+      const message =
+        JSON.stringify({
+          type: 1,
+          invocationId: invocationId,
+          target: target,
+          // 官方 Web 默认 UseGzip=true；这里关闭 gzip，直接返回 JSON 对象。
+          arguments: [params, { UseGzip: false }],
+        }) + "\x1e";
+
+      return { invocationId: invocationId, index: index, message: message };
+    });
+
+    const pending = new Map(
+      invocations.map((item) => [item.invocationId, item.index]),
+    );
+    const results = new Array(invocations.length);
+    const payload = invocations.map((item) => item.message).join("");
 
     const send = await Network.post(
       session.url,
       this._authTextHeaders(),
-      message,
+      payload,
     );
 
     this._assertStatus(send, 200, `SignalR invoke ${target}`);
 
-    // 正常调用通常在下一次 poll 就会收到 Completion；Ping/空轮询则继续。
-    for (let i = 0; i < 20; i++) {
+    // 通常一次 poll 会携带多个 Completion；若服务端分批推送则继续轮询。
+    const maxPolls = Math.max(20, invocations.length * 2);
+
+    for (let i = 0; i < maxPolls; i++) {
       const poll = await Network.get(
         this._pollUrl(session),
         this._pollHeaders(),
@@ -453,82 +518,41 @@ class LightNovelShelf extends ComicSource {
       this._assertStatus(poll, 200, `SignalR poll ${target}`);
 
       for (const frame of this._frames(poll.body)) {
-        // type 1 = Invocation（例如服务器主动 OnMessage 公告），不是当前请求结果。
-        if (frame.type === 1) {
+        // type 1 = 服务端 Invocation（例如 OnMessage 公告）；type 6 = Ping。
+        if (frame.type === 1 || frame.type === 6) {
           continue;
         }
 
-        // type 6 = Ping
-        if (frame.type === 6) {
-          continue;
-        }
-
-        // type 7 = Close
         if (frame.type === 7) {
           throw `SignalR 服务端关闭连接${
             frame.error ? `: ${frame.error}` : ""
           }`;
         }
 
-        // type 3 = Completion
-        if (
-          frame.type === 3 &&
-          String(frame.invocationId) === invocationId
-        ) {
-          if (frame.error) {
-            throw `SignalR ${target} 调用失败: ${frame.error}`;
-          }
-
-          let envelope = frame.result;
-
-          // 轻书架目前的 Hub JSON 使用 camelCase：
-          // { response: ... }
-          // 旧实现/其他线路可能仍返回 PascalCase：
-          // { Success, Response, Status, Msg }
-          // 因此这里同时兼容两种字段风格。
-          if (envelope && typeof envelope === "object") {
-            const hasSuccess =
-              Object.prototype.hasOwnProperty.call(envelope, "Success") ||
-              Object.prototype.hasOwnProperty.call(envelope, "success");
-
-            if (hasSuccess) {
-              const success =
-                envelope.Success !== undefined
-                  ? envelope.Success
-                  : envelope.success;
-
-              if (!success) {
-                const status =
-                  envelope.Status !== undefined
-                    ? envelope.Status
-                    : envelope.status;
-                const msg =
-                  envelope.Msg !== undefined
-                    ? envelope.Msg
-                    : envelope.msg;
-
-                throw `${target} 失败${
-                  status !== undefined ? ` [${status}]` : ""
-                }: ${msg || "Unknown error"}`;
-              }
-            }
-
-            // 当前轻书架实际返回 { response: ... }。
-            if (Object.prototype.hasOwnProperty.call(envelope, "response")) {
-              return envelope.response;
-            }
-
-            if (Object.prototype.hasOwnProperty.call(envelope, "Response")) {
-              return envelope.Response;
-            }
-          }
-
-          return envelope;
+        if (frame.type !== 3) {
+          continue;
         }
+
+        const invocationId = String(frame.invocationId);
+        if (!pending.has(invocationId)) {
+          continue;
+        }
+
+        if (frame.error) {
+          throw `SignalR ${target} 调用失败: ${frame.error}`;
+        }
+
+        const index = pending.get(invocationId);
+        results[index] = this._unwrapHubResult(target, frame.result);
+        pending.delete(invocationId);
+      }
+
+      if (pending.size === 0) {
+        return results;
       }
     }
 
-    throw `等待 SignalR ${target} 返回结果超时`;
+    throw `等待 SignalR ${target} 返回结果超时（剩余 ${pending.size}/${invocations.length}）`;
   }
 
   /**
@@ -557,7 +581,8 @@ class LightNovelShelf extends ComicSource {
       session = await this._openHub(true);
       return await this._hubInvoke(session, target, params);
     } finally {
-      await this._closeHub(session);
+      // 关闭请求已发出即可返回数据，不再阻塞页面等待 DELETE 响应。
+      this._closeHub(session);
     }
   }
 
@@ -817,23 +842,17 @@ class LightNovelShelf extends ComicSource {
       }
 
       // GetComicContent 一次最多读取 12 页。
-      // 同一 SignalR session 内循环读取整章，减少 negotiate/handshake 次数。
+      // 首批用于取得总页数；其余分页在同一个 SignalR payload 中批量发送。
       let session = null;
 
       const loadWholeChapter = async (forceRefresh) => {
         session = await this._openHub(forceRefresh);
 
+        const take = 12;
         const images = [];
-        let skip = 0;
         let total = 0;
 
-        for (let batchIndex = 0; batchIndex < 500; batchIndex++) {
-          const data = await this._hubInvoke(session, "GetComicContent", {
-            Cid: cid,
-            Skip: skip,
-            Take: 12,
-          });
-
+        const appendBatch = (data) => {
           const chapter = this._value(data, "chapter", "Chapter", null);
 
           if (!chapter) {
@@ -842,22 +861,93 @@ class LightNovelShelf extends ComicSource {
 
           const imagesRaw = this._value(chapter, "images", "Images", []);
           const batch = Array.isArray(imagesRaw) ? imagesRaw : [];
-          total = Number(this._value(chapter, "total", "Total", 0) || 0);
+          const reportedTotal = Number(
+            this._value(chapter, "total", "Total", 0) || 0,
+          );
+
+          if (reportedTotal > 0) {
+            total = reportedTotal;
+          }
 
           for (const image of batch) {
             images.push(this._normalizeUrl(image));
           }
 
-          if (batch.length === 0) break;
+          return batch;
+        };
 
-          skip += batch.length;
+        let batch = appendBatch(
+          await this._hubInvoke(session, "GetComicContent", {
+            Cid: cid,
+            Skip: 0,
+            Take: take,
+          }),
+        );
+        let skip = batch.length;
+        const initialTotal = total;
 
-          if (total > 0 && skip >= total) break;
-          if (total <= 0 && batch.length < 12) break;
+        if (batch.length === take && initialTotal > skip) {
+          const remainingBatchCount = Math.ceil(
+            (initialTotal - skip) / take,
+          );
+
+          if (remainingBatchCount > 499) {
+            throw `章节分页数量异常: ${remainingBatchCount} 批`;
+          }
+
+          const paramsList = [];
+
+          for (
+            let nextSkip = skip;
+            nextSkip < initialTotal;
+            nextSkip += take
+          ) {
+            paramsList.push({ Cid: cid, Skip: nextSkip, Take: take });
+          }
+
+          const remaining = await this._hubInvokeMany(
+            session,
+            "GetComicContent",
+            paramsList,
+          );
+
+          for (let index = 0; index < remaining.length; index++) {
+            const params = paramsList[index];
+            const currentBatch = appendBatch(remaining[index]);
+            const expectedCount = Math.min(
+              take,
+              initialTotal - params.Skip,
+            );
+
+            if (currentBatch.length !== expectedCount) {
+              throw `章节分页数据不完整: Skip ${params.Skip}, 预期 ${expectedCount} 页，实际 ${currentBatch.length} 页`;
+            }
+          }
+        } else {
+          // 服务端未返回可靠总页数或首批不足 12 页时，保留串行兼容路径。
+          for (let batchIndex = 1; batchIndex < 500; batchIndex++) {
+            if (batch.length === 0) break;
+            if (total > 0 && skip >= total) break;
+            if (total <= 0 && batch.length < take) break;
+
+            batch = appendBatch(
+              await this._hubInvoke(session, "GetComicContent", {
+                Cid: cid,
+                Skip: skip,
+                Take: take,
+              }),
+            );
+            skip += batch.length;
+          }
         }
 
         if (!images.length) {
           throw "该章节未返回任何图片";
+        }
+
+        const expectedTotal = initialTotal > 0 ? initialTotal : total;
+        if (expectedTotal > 0 && images.length !== expectedTotal) {
+          throw `章节图片数量不完整: 预期 ${expectedTotal} 页，实际 ${images.length} 页`;
         }
 
         return { images: images };
@@ -880,7 +970,8 @@ class LightNovelShelf extends ComicSource {
           return await loadWholeChapter(true);
         }
       } finally {
-        await this._closeHub(session);
+        // 与详情页一致，后台关闭连接，不阻塞图片列表返回。
+        this._closeHub(session);
       }
     },
 
