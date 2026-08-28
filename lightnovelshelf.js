@@ -41,6 +41,7 @@ class LightNovelShelf extends ComicSource {
   _historyComicIds = null;
   _historySeenSeries = new Set();
   _historyNextPage = 1;
+  _historyRequestGeneration = 0;
 
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
@@ -1021,6 +1022,7 @@ class LightNovelShelf extends ComicSource {
     this._historyComicIds = null;
     this._historySeenSeries = new Set();
     this._historyNextPage = 1;
+    this._historyRequestGeneration += 1;
   }
 
   _historyIdsFromResponse(data) {
@@ -1035,6 +1037,13 @@ class LightNovelShelf extends ComicSource {
       throw new Error("无效阅读历史页码");
     }
 
+    const requestGeneration = this._historyRequestGeneration;
+    const assertCurrentRequest = () => {
+      if (requestGeneration !== this._historyRequestGeneration) {
+        throw new Error("阅读历史请求已失效");
+      }
+    };
+
     const refreshHistory =
       page === 1 ||
       !Array.isArray(this._historyComicIds) ||
@@ -1042,6 +1051,7 @@ class LightNovelShelf extends ComicSource {
 
     if (refreshHistory) {
       const history = await this._hubCall("GetReadHistory", {});
+      assertCurrentRequest();
       this._historyComicIds = this._historyIdsFromResponse(history);
       this._historySeenSeries = new Set();
     }
@@ -1057,6 +1067,7 @@ class LightNovelShelf extends ComicSource {
         Ids: pageIds,
         Type: "Comic",
       });
+      assertCurrentRequest();
       const list = this._value(data, "data", "Data", []);
 
       for (const item of Array.isArray(list) ? list : []) {
