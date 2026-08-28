@@ -1037,7 +1037,7 @@ class LightNovelShelf extends ComicSource {
       throw new Error("无效阅读历史页码");
     }
 
-    const requestGeneration = this._historyRequestGeneration;
+    const requestGeneration = ++this._historyRequestGeneration;
     const assertCurrentRequest = () => {
       if (requestGeneration !== this._historyRequestGeneration) {
         throw new Error("阅读历史请求已失效");
