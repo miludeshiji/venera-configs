@@ -242,6 +242,26 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
+  _tryAutoSignIn() {
+    try {
+      if (!this.loadSetting("dailySignInTask")) return;
+      if (!this.isLogged || this._signInInProgress) return;
+
+      const today = this._utcDate();
+      if (this.loadData("lastSignInUtcDate") === today) return;
+      if (this._autoSignInAttemptDate === today) return;
+
+      // 先记录尝试，防止紧邻的多个 Hub 请求同时启动签到。
+      this._autoSignInAttemptDate = today;
+      const task = this.dailySignIn(true);
+      if (task && typeof task.catch === "function") {
+        task.catch(() => {});
+      }
+    } catch (_) {
+      // 自动签到不得影响原漫画请求。
+    }
+  }
+
   _getVisitorId() {
     const saved = this.loadData("visitorId");
     const normalizedSaved = String(saved == null ? "" : saved)
@@ -770,10 +790,13 @@ class LightNovelShelf extends ComicSource {
    */
   async _hubCall(target, params) {
     let session = null;
+    let succeeded = false;
 
     try {
       session = await this._openHub(false);
-      return await this._hubInvoke(session, target, params);
+      const result = await this._hubInvoke(session, target, params);
+      succeeded = true;
+      return result;
     } catch (error) {
       if (!this._isUnauthorizedError(error)) {
         throw error;
@@ -786,10 +809,17 @@ class LightNovelShelf extends ComicSource {
       this._sessionTokenAt = 0;
 
       session = await this._openHub(true);
-      return await this._hubInvoke(session, target, params);
+      const result = await this._hubInvoke(session, target, params);
+      succeeded = true;
+      return result;
     } finally {
       // 关闭请求已发出即可返回数据，不再阻塞页面等待 DELETE 响应。
       this._closeHub(session);
+
+      // 签到请求本身不递归触发；后台任务不被原请求等待。
+      if (succeeded && target !== "SignIn") {
+        this._tryAutoSignIn();
+      }
     }
   }
 
@@ -855,6 +885,8 @@ class LightNovelShelf extends ComicSource {
 
     logout: () => {
       this.deleteData("refreshToken");
+      this.deleteData("lastSignInUtcDate");
+      this._autoSignInAttemptDate = "";
       this._sessionToken = "";
       this._sessionTokenAt = 0;
     },
