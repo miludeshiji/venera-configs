@@ -19,6 +19,8 @@
  * 3. x-id 与令牌由漫画源自动生成和管理。
  */
 class LightNovelShelf extends ComicSource {
+  static discoveryPageSize = 12;
+
   name = "轻书架";
   key = "LightNovelShelf";
   version = "0.2.9";
@@ -34,6 +36,11 @@ class LightNovelShelf extends ComicSource {
   // 每日签到状态：成功日期持久化，尝试日期只作用于当前 JS 实例。
   _signInInProgress = false;
   _autoSignInAttemptDate = "";
+
+  // 阅读历史仅缓存当前列表会话；第 1 页、非连续分页和退出账号时重置。
+  _historyComicIds = null;
+  _historySeenSeries = new Set();
+  _historyNextPage = 1;
 
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
@@ -1010,6 +1017,65 @@ class LightNovelShelf extends ComicSource {
     };
   }
 
+  _resetReadingHistoryState() {
+    this._historyComicIds = null;
+    this._historySeenSeries = new Set();
+    this._historyNextPage = 1;
+  }
+
+  _historyIdsFromResponse(data) {
+    const ids = this._value(data, "comic", "Comic", []);
+    if (!Array.isArray(ids)) return [];
+
+    return ids.filter((id) => Number.isSafeInteger(id) && id > 0);
+  }
+
+  async _loadReadingHistory(page) {
+    if (!Number.isSafeInteger(page) || page < 1) {
+      throw new Error("无效阅读历史页码");
+    }
+
+    const refreshHistory =
+      page === 1 ||
+      !Array.isArray(this._historyComicIds) ||
+      page !== this._historyNextPage;
+
+    if (refreshHistory) {
+      const history = await this._hubCall("GetReadHistory", {});
+      this._historyComicIds = this._historyIdsFromResponse(history);
+      this._historySeenSeries = new Set();
+    }
+
+    const ids = this._historyComicIds;
+    const size = LightNovelShelf.discoveryPageSize;
+    const maxPage = Math.max(1, Math.ceil(ids.length / size));
+    const pageIds = ids.slice((page - 1) * size, page * size);
+    const comics = [];
+
+    if (pageIds.length > 0) {
+      const data = await this._hubCall("GetBookListByIds", {
+        Ids: pageIds,
+        Type: "Comic",
+      });
+      const list = this._value(data, "data", "Data", []);
+
+      for (const item of Array.isArray(list) ? list : []) {
+        const comic = this._comicFromListItem(item);
+        if (!comic.id || this._historySeenSeries.has(comic.id)) continue;
+
+        this._historySeenSeries.add(comic.id);
+        comics.push(comic);
+      }
+    }
+
+    this._historyNextPage = page + 1;
+
+    return {
+      comics: comics,
+      maxPage: maxPage,
+    };
+  }
+
   account = {
     login: async (account, pwd) => {
       return await this._login(account, pwd);
@@ -1021,6 +1087,7 @@ class LightNovelShelf extends ComicSource {
       this._autoSignInAttemptDate = "";
       this._sessionToken = "";
       this._sessionTokenAt = 0;
+      this._resetReadingHistoryState();
     },
   };
 
