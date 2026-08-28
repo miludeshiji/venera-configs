@@ -149,29 +149,128 @@ class LightNovelShelf extends ComicSource {
   }
 
   _getVisitorId() {
-    const value = this.loadSetting("visitorId");
+    const saved = this.loadData("visitorId");
+    const normalizedSaved = String(saved == null ? "" : saved)
+      .trim()
+      .replace(/-/g, "")
+      .toLowerCase();
+
+    if (/^[0-9a-f]{32}$/.test(normalizedSaved)) {
+      if (saved !== normalizedSaved) {
+        this.saveData("visitorId", normalizedSaved);
+      }
+      return normalizedSaved;
+    }
+
+    const generated = String(createUuid())
+      .trim()
+      .replace(/-/g, "")
+      .toLowerCase();
+
+    if (!/^[0-9a-f]{32}$/.test(generated)) {
+      throw new Error("生成轻书架设备标识失败");
+    }
+
+    this.saveData("visitorId", generated);
+    return generated;
+  }
+
+  _getRefreshToken() {
+    const value = this.loadData("refreshToken");
 
     if (!value || !String(value).trim()) {
-      throw (
-        "轻书架需要 x-id / Visitor ID。\n" +
-        "请在轻书架网页已登录状态下打开浏览器开发者工具，从请求头中复制 x-id，然后填入漫画源设置。"
+      throw new Error(
+        "轻书架需要登录。请在 Venera 漫画源设置的账号区域登录轻书架。",
       );
     }
 
     return String(value).trim();
   }
 
-  _getRefreshToken() {
-    const value = this.loadSetting("refreshToken");
+  _hashPassword(password) {
+    const hash = Convert.hexEncode(
+      Convert.sha256(Convert.encodeUtf8(password)),
+    );
+    const normalized = String(hash || "").toLowerCase();
 
-    if (!value || !String(value).trim()) {
-      throw (
-        "轻书架需要登录。\n" +
-        "请先在轻书架官网正常登录，再从登录响应中复制 RefreshToken，并填入漫画源设置。"
-      );
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+      throw new Error("生成轻书架密码摘要失败");
     }
 
-    return String(value).trim();
+    return normalized;
+  }
+
+  async _login(account, pwd) {
+    const email = String(account == null ? "" : account).trim();
+    const password = String(pwd == null ? "" : pwd);
+
+    if (!email) {
+      throw new Error("轻书架登录失败：邮箱不能为空");
+    }
+    if (!password) {
+      throw new Error("轻书架登录失败：密码不能为空");
+    }
+
+    const visitorId = this._getVisitorId();
+    const passwordHash = this._hashPassword(password);
+    const res = await Network.post(
+      this.apiBase + "/api/user/login",
+      this._jsonHeaders({
+        "x-id": visitorId,
+      }),
+      JSON.stringify({
+        email: email,
+        password: passwordHash,
+      }),
+    );
+
+    if (!res || res.status !== 200) {
+      const status = res && res.status !== undefined ? res.status : "未知";
+      throw new Error(`轻书架登录失败: HTTP ${status}`);
+    }
+
+    let envelope;
+    try {
+      envelope = JSON.parse(res.body);
+    } catch (_) {
+      throw new Error("轻书架登录失败：服务器返回了无效 JSON");
+    }
+
+    if (
+      !envelope ||
+      typeof envelope !== "object" ||
+      !Object.prototype.hasOwnProperty.call(envelope, "Success")
+    ) {
+      throw new Error("轻书架登录失败：服务器响应格式错误");
+    }
+
+    if (!envelope.Success) {
+      const status =
+        envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
+      const message =
+        typeof envelope.Msg === "string" && envelope.Msg.trim()
+          ? `: ${envelope.Msg.trim()}`
+          : "";
+      throw new Error(`轻书架登录失败${status}${message}`);
+    }
+
+    const result = envelope.Response;
+    const refreshToken =
+      result && typeof result.RefreshToken === "string"
+        ? result.RefreshToken.trim()
+        : "";
+    const sessionToken =
+      result && typeof result.Token === "string" ? result.Token.trim() : "";
+
+    if (!refreshToken || !sessionToken) {
+      throw new Error("轻书架登录失败：响应缺少 RefreshToken 或 Token");
+    }
+
+    this.saveData("refreshToken", refreshToken);
+    this._sessionToken = sessionToken;
+    this._sessionTokenAt = Date.now();
+
+    return email;
   }
 
   /**
@@ -206,15 +305,23 @@ class LightNovelShelf extends ComicSource {
       }),
     );
 
-    this._assertStatus(res, 200, "刷新轻书架登录状态");
+    if (!res || res.status !== 200) {
+      this._sessionToken = "";
+      this._sessionTokenAt = 0;
+      const status = res && res.status !== undefined ? res.status : "未知";
+      throw new Error(
+        `刷新轻书架登录状态失败: HTTP ${status}。请在 Venera 中重新登录。`,
+      );
+    }
 
     let envelope;
     try {
       envelope = JSON.parse(res.body);
     } catch (_) {
-      throw (
-        "刷新轻书架登录状态失败：服务器返回了无效 JSON\n" +
-        (res.body || "")
+      this._sessionToken = "";
+      this._sessionTokenAt = 0;
+      throw new Error(
+        "刷新轻书架登录状态失败：服务器返回了无效 JSON。请在 Venera 中重新登录。",
       );
     }
 
@@ -229,10 +336,14 @@ class LightNovelShelf extends ComicSource {
         this._sessionToken = "";
         this._sessionTokenAt = 0;
 
-        throw (
-          "RefreshToken 无效、已过期或账号状态异常" +
-          (envelope.Status !== undefined ? ` [${envelope.Status}]` : "") +
-          (envelope.Msg ? `: ${envelope.Msg}` : "")
+        const status =
+          envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
+        const message =
+          typeof envelope.Msg === "string" && envelope.Msg.trim()
+            ? `: ${envelope.Msg.trim()}`
+            : "";
+        throw new Error(
+          `轻书架登录已失效${status}${message}。请在 Venera 中重新登录。`,
         );
       }
 
@@ -249,7 +360,9 @@ class LightNovelShelf extends ComicSource {
     if (!token || typeof token !== "string") {
       this._sessionToken = "";
       this._sessionTokenAt = 0;
-      throw "刷新轻书架登录状态失败：响应中没有可用的会话 Token";
+      throw new Error(
+        "刷新轻书架登录状态失败：响应中没有可用的会话 Token。请在 Venera 中重新登录。",
+      );
     }
 
     this._sessionToken = token;
@@ -640,6 +753,18 @@ class LightNovelShelf extends ComicSource {
       maxPage: Number(totalPages || 1),
     };
   }
+
+  account = {
+    login: async (account, pwd) => {
+      return await this._login(account, pwd);
+    },
+
+    logout: () => {
+      this.deleteData("refreshToken");
+      this._sessionToken = "";
+      this._sessionTokenAt = 0;
+    },
+  };
 
   explore = [
     {
@@ -1043,20 +1168,6 @@ class LightNovelShelf extends ComicSource {
   };
 
   settings = {
-    refreshToken: {
-      title: "RefreshToken",
-      type: "input",
-      validator: null,
-      default: "",
-    },
-
-    visitorId: {
-      title: "x-id / Visitor ID",
-      type: "input",
-      validator: null,
-      default: "",
-    },
-
     apiServer: {
       title: "API 线路",
       type: "select",
