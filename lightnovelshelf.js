@@ -838,6 +838,137 @@ class LightNovelShelf extends ComicSource {
     return fallback;
   }
 
+  _positiveCommentInteger(value) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number > 0 ? number : null;
+  }
+
+  _encodeCommentReference(id, page) {
+    const commentId = this._positiveCommentInteger(id);
+    const commentPage = this._positiveCommentInteger(page);
+
+    if (commentId === null || commentPage === null) {
+      return null;
+    }
+
+    return `${commentId}//${commentPage}`;
+  }
+
+  _parseCommentReference(value) {
+    const match = String(value == null ? "" : value).match(
+      /^([1-9]\d*)\/\/([1-9]\d*)$/,
+    );
+
+    if (!match) {
+      throw new Error("无效评论 ID");
+    }
+
+    const id = this._positiveCommentInteger(match[1]);
+    const page = this._positiveCommentInteger(match[2]);
+
+    if (id === null || page === null) {
+      throw new Error("无效评论 ID");
+    }
+
+    return { id: id, page: page };
+  }
+
+  _seriesCommentParams(comicId, page) {
+    return {
+      Type: "Series",
+      Id: 0,
+      SeriesTitle: String(comicId),
+      Page: page,
+    };
+  }
+
+  _commentResponseParts(data) {
+    const entries = this._value(data, "data", "Data", null);
+    const users = this._value(data, "users", "Users", null);
+    const commentaries = this._value(
+      data,
+      "commentaries",
+      "Commentaries",
+      null,
+    );
+    const isRecord = (value) =>
+      value !== null && typeof value === "object" && !Array.isArray(value);
+
+    if (!Array.isArray(entries) || !isRecord(users) || !isRecord(commentaries)) {
+      throw new Error("评论响应格式异常");
+    }
+
+    return {
+      entries: entries,
+      users: users,
+      commentaries: commentaries,
+    };
+  }
+
+  _commentRecord(dictionary, id) {
+    if (!dictionary || typeof dictionary !== "object") return null;
+
+    const key = String(id);
+    if (!Object.prototype.hasOwnProperty.call(dictionary, key)) return null;
+
+    const value = dictionary[key];
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value
+      : null;
+  }
+
+  _commentFromResponse(commentaries, users, id, options = {}) {
+    const commentary = this._commentRecord(commentaries, id);
+    if (!commentary) return null;
+
+    const userId = this._value(commentary, "userId", "UserId", null);
+    const user = this._commentRecord(users, userId);
+    const rawUserName = this._value(
+      user,
+      "userName",
+      "UserName",
+      "未知用户",
+    );
+    const rawAvatar = this._value(user, "avatar", "Avatar", "");
+    const rawContent = this._value(commentary, "content", "Content", "");
+    const rawTime = this._value(
+      commentary,
+      "createdAt",
+      "CreatedAt",
+      this._value(commentary, "createdTime", "CreatedTime", null),
+    );
+
+    const comment = {
+      userName: String(rawUserName || "未知用户"),
+      content: String(rawContent == null ? "" : rawContent),
+      id: String(options.id === undefined ? id : options.id),
+    };
+
+    if (rawAvatar) {
+      comment.avatar = this._normalizeUrl(String(rawAvatar));
+    }
+
+    if (rawTime !== null && rawTime !== undefined && rawTime !== "") {
+      comment.time = String(rawTime);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(options, "replyCount")) {
+      comment.replyCount = options.replyCount;
+    }
+
+    return comment;
+  }
+
+  _replyTargetUserName(commentaries, users, replyId) {
+    const commentary = this._commentRecord(commentaries, replyId);
+    if (!commentary) return "";
+
+    const userId = this._value(commentary, "userId", "UserId", null);
+    const user = this._commentRecord(users, userId);
+    const userName = this._value(user, "userName", "UserName", "");
+    return userName ? String(userName) : "";
+  }
+
   _comicFromListItem(item) {
     const title = this._value(item, "title", "Title", "");
     const count = Number(this._value(item, "count", "Count", 0) || 0);
@@ -1251,6 +1382,114 @@ class LightNovelShelf extends ComicSource {
         // 与详情页一致，后台关闭连接，不阻塞图片列表返回。
         this._closeHub(session);
       }
+    },
+
+    loadComments: async (comicId, subId, page, replyTo) => {
+      const reference = replyTo
+        ? this._parseCommentReference(replyTo)
+        : null;
+      const requestPage = reference
+        ? reference.page
+        : this._positiveCommentInteger(page);
+
+      if (requestPage === null) {
+        throw new Error("无效评论页码");
+      }
+
+      const data = await this._hubCall(
+        "GetComments",
+        this._seriesCommentParams(comicId, requestPage),
+      );
+      const parts = this._commentResponseParts(data);
+
+      if (reference) {
+        const parent = parts.entries.find((entry) => {
+          const id = this._positiveCommentInteger(
+            this._value(entry, "id", "Id", null),
+          );
+          return id === reference.id;
+        });
+
+        if (!parent) {
+          return { comments: [], maxPage: 1 };
+        }
+
+        const replyIds = this._value(parent, "reply", "Reply", []);
+        const comments = [];
+
+        for (const rawReplyId of Array.isArray(replyIds) ? replyIds : []) {
+          const replyId = this._positiveCommentInteger(rawReplyId);
+          if (replyId === null) continue;
+
+          const comment = this._commentFromResponse(
+            parts.commentaries,
+            parts.users,
+            replyId,
+          );
+          if (!comment) continue;
+
+          const commentary = this._commentRecord(
+            parts.commentaries,
+            replyId,
+          );
+          const targetId = this._positiveCommentInteger(
+            this._value(commentary, "replyId", "ReplyId", null),
+          );
+
+          if (targetId !== null) {
+            const targetName = this._replyTargetUserName(
+              parts.commentaries,
+              parts.users,
+              targetId,
+            );
+            if (targetName) {
+              comment.content = `回复 @${targetName}：${comment.content}`;
+            }
+          }
+
+          comments.push(comment);
+        }
+
+        return { comments: comments, maxPage: 1 };
+      }
+
+      const comments = [];
+
+      for (const entry of parts.entries) {
+        const commentId = this._positiveCommentInteger(
+          this._value(entry, "id", "Id", null),
+        );
+        if (commentId === null) continue;
+
+        const encodedId = this._encodeCommentReference(commentId, requestPage);
+        if (!encodedId) continue;
+
+        const replyIds = this._value(entry, "reply", "Reply", []);
+        const comment = this._commentFromResponse(
+          parts.commentaries,
+          parts.users,
+          commentId,
+          {
+            id: encodedId,
+            replyCount: Array.isArray(replyIds) ? replyIds.length : 0,
+          },
+        );
+
+        if (comment) comments.push(comment);
+      }
+
+      const rawTotalPages = Number(
+        this._value(data, "totalPages", "TotalPages", 1),
+      );
+      const maxPage =
+        Number.isFinite(rawTotalPages) && rawTotalPages > 0
+          ? Math.floor(rawTotalPages)
+          : 1;
+
+      return {
+        comments: comments,
+        maxPage: maxPage,
+      };
     },
 
     onImageLoad: (url, comicId, epId) => {
