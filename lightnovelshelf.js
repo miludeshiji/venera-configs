@@ -1492,6 +1492,34 @@ class LightNovelShelf extends ComicSource {
       };
     },
 
+    sendComment: async (comicId, subId, content, replyTo) => {
+      if (!this.isLogged) {
+        throw new Error("请先登录轻书架账号");
+      }
+
+      const text = String(content == null ? "" : content);
+      if (!text.trim()) {
+        throw new Error("评论内容不能为空");
+      }
+
+      const params = {
+        Type: "Series",
+        Id: 0,
+        SeriesTitle: String(comicId),
+        Content: text,
+      };
+
+      if (replyTo) {
+        const reference = this._parseCommentReference(replyTo);
+        params.ParentId = reference.id;
+        await this._hubCall("ReplyComment", params);
+      } else {
+        await this._hubCall("PostComment", params);
+      }
+
+      return "ok";
+    },
+
     onImageLoad: (url, comicId, epId) => {
       return {
         headers: {
