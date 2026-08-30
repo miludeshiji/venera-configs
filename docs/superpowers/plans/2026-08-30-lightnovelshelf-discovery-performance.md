@@ -159,17 +159,6 @@ function completion(invocationId, response) {
   );
 }
 
-async function rejectionText(work) {
-  let rejection;
-  try {
-    await work();
-  } catch (error) {
-    rejection = error;
-  }
-  assert.notEqual(rejection, undefined, "expected operation to reject");
-  return String(rejection && rejection.message ? rejection.message : rejection);
-}
-
 function deferred() {
   let resolve;
   let reject;
@@ -790,8 +779,8 @@ test("退出账号使尚未完成的发现页历史请求失效", async () => {
   source.account.logout();
   details.resolve({ Data: [listItem("旧历史")] });
 
-  const error = await rejectionText(() => loading);
-  assert.match(error, /阅读历史请求已失效/);
+  const result = await loading;
+  assert.deepEqual(plain(result.map((part) => part.comics)), [[], [], []]);
   assert.equal(source._historyComicIds, null);
   assert.equal(source._historySeenSeries.size, 0);
   assert.equal(source._historyNextPage, 1);

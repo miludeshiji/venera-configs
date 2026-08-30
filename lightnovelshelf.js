@@ -98,18 +98,41 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
-  _authHeaders(extra) {
+  _authHeadersForToken(sessionToken, extra) {
     const headers = this._headers(extra);
 
-    if (this._sessionToken) {
-      headers.Authorization = "Bearer " + this._sessionToken;
+    if (sessionToken) {
+      headers.Authorization = "Bearer " + sessionToken;
     }
 
     return headers;
   }
 
+  _authHeaders(extra) {
+    return this._authHeadersForToken(this._sessionToken, extra);
+  }
+
+  _sessionAuthHeaders(session, extra) {
+    return this._authHeadersForToken(
+      session && session.sessionToken,
+      extra,
+    );
+  }
+
   _authTextHeaders(extra) {
     return this._authHeaders(
+      Object.assign(
+        {
+          "Content-Type": "text/plain;charset=UTF-8",
+        },
+        extra || {},
+      ),
+    );
+  }
+
+  _sessionAuthTextHeaders(session, extra) {
+    return this._sessionAuthHeaders(
+      session,
       Object.assign(
         {
           "Content-Type": "text/plain;charset=UTF-8",
@@ -350,8 +373,19 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
-  _clearSessionTokenIfOwned(authGeneration, refreshToken) {
+  _clearSessionTokenIfOwned(
+    authGeneration,
+    refreshToken,
+    ownedSessionToken,
+  ) {
     if (!this._authStateMatches(authGeneration, refreshToken)) return;
+    if (
+      ownedSessionToken === undefined ||
+      this._sessionToken !== ownedSessionToken ||
+      this._sessionTokenGeneration !== authGeneration
+    ) {
+      return;
+    }
 
     this._sessionToken = "";
     this._sessionTokenAt = 0;
@@ -463,6 +497,7 @@ class LightNovelShelf extends ComicSource {
   async _refreshSessionToken(force) {
     const authGeneration = this._authGeneration;
     const refreshToken = this._getRefreshToken();
+    const ownedSessionToken = this._sessionToken;
 
     // 同一认证代际和 RefreshToken 只允许一个刷新请求在途。
     if (
@@ -506,7 +541,11 @@ class LightNovelShelf extends ComicSource {
       assertCurrentAuth();
 
       if (!res || res.status !== 200) {
-        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        this._clearSessionTokenIfOwned(
+          authGeneration,
+          refreshToken,
+          ownedSessionToken,
+        );
         const status = res && res.status !== undefined ? res.status : "未知";
         throw new Error(
           `刷新轻书架登录状态失败: HTTP ${status}。请在 Venera 中重新登录。`,
@@ -517,7 +556,11 @@ class LightNovelShelf extends ComicSource {
       try {
         envelope = JSON.parse(res.body);
       } catch (_) {
-        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        this._clearSessionTokenIfOwned(
+          authGeneration,
+          refreshToken,
+          ownedSessionToken,
+        );
         throw new Error(
           "刷新轻书架登录状态失败：服务器返回了无效 JSON。请在 Venera 中重新登录。",
         );
@@ -531,7 +574,11 @@ class LightNovelShelf extends ComicSource {
         Object.prototype.hasOwnProperty.call(envelope, "Success")
       ) {
         if (!envelope.Success) {
-          this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+          this._clearSessionTokenIfOwned(
+            authGeneration,
+            refreshToken,
+            ownedSessionToken,
+          );
 
           const status =
             envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
@@ -556,7 +603,11 @@ class LightNovelShelf extends ComicSource {
       }
 
       if (!token || typeof token !== "string") {
-        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        this._clearSessionTokenIfOwned(
+          authGeneration,
+          refreshToken,
+          ownedSessionToken,
+        );
         throw new Error(
           "刷新轻书架登录状态失败：响应中没有可用的会话 Token。请在 Venera 中重新登录。",
         );
@@ -604,8 +655,11 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
-  _pollHeaders() {
-    return this._authHeaders({
+  _pollHeaders(session) {
+    const headers = session
+      ? this._sessionAuthHeaders(session)
+      : this._authHeaders();
+    return Object.assign(headers, {
       "Cache-Control": "no-cache, no-store",
       Pragma: "no-cache",
     });
@@ -622,14 +676,34 @@ class LightNovelShelf extends ComicSource {
    * -> GET handshake response
    */
   async _openHub(forceRefresh) {
+    const authGeneration = this._authGeneration;
+    const refreshToken = this._getRefreshToken();
     await this._refreshSessionToken(!!forceRefresh);
+
+    if (
+      !this._authStateMatches(authGeneration, refreshToken) ||
+      this._sessionTokenGeneration !== authGeneration ||
+      !this._sessionToken
+    ) {
+      throw new Error("轻书架登录状态已变更，无法建立会话");
+    }
 
     const hubUrl = this.apiBase + "/hub/api";
     const negotiateUrl = hubUrl + "/negotiate?negotiateVersion=1";
+    const sessionToken = this._sessionToken;
+    const session = {
+      url: "",
+      seq: 0,
+      pollSeq: 0,
+      authGeneration: authGeneration,
+      refreshToken: refreshToken,
+      // 会话创建后始终使用此 Token，不跟随全局 Token 变化。
+      sessionToken: sessionToken,
+    };
 
     const negotiateRes = await Network.post(
       negotiateUrl,
-      this._authTextHeaders(),
+      this._sessionAuthTextHeaders(session),
       "",
     );
 
@@ -674,16 +748,12 @@ class LightNovelShelf extends ComicSource {
       throw "服务端 LongPolling 不支持 Text transfer format";
     }
 
-    const session = {
-      url: hubUrl + "?id=" + encodeURIComponent(connectionToken),
-      seq: 0,
-      pollSeq: 0,
-    };
+    session.url = hubUrl + "?id=" + encodeURIComponent(connectionToken);
 
     // SignalR Long Polling 的第一次 GET 用于初始化 transport。
     const initRes = await Network.get(
       this._pollUrl(session),
-      this._pollHeaders(),
+      this._pollHeaders(session),
     );
 
     this._assertStatus(initRes, 200, "SignalR transport 初始化");
@@ -693,7 +763,7 @@ class LightNovelShelf extends ComicSource {
 
     const sendHandshakeRes = await Network.post(
       session.url,
-      this._authTextHeaders(),
+      this._sessionAuthTextHeaders(session),
       handshake,
     );
 
@@ -705,7 +775,7 @@ class LightNovelShelf extends ComicSource {
     for (let i = 0; i < 6 && !handshakeDone; i++) {
       const poll = await Network.get(
         this._pollUrl(session),
-        this._pollHeaders(),
+        this._pollHeaders(session),
       );
 
       if (poll.status === 204) {
@@ -737,7 +807,7 @@ class LightNovelShelf extends ComicSource {
     if (!session || !session.url) return;
 
     try {
-      await Network.delete(session.url, this._authHeaders());
+      await Network.delete(session.url, this._sessionAuthHeaders(session));
     } catch (_) {
       // 关闭失败不影响已经取得的漫画数据。
     }
@@ -839,7 +909,7 @@ class LightNovelShelf extends ComicSource {
 
     const send = await Network.post(
       session.url,
-      this._authTextHeaders(),
+      this._sessionAuthTextHeaders(session),
       payload,
     );
 
@@ -851,7 +921,7 @@ class LightNovelShelf extends ComicSource {
     for (let i = 0; i < maxPolls; i++) {
       const poll = await Network.get(
         this._pollUrl(session),
-        this._pollHeaders(),
+        this._pollHeaders(session),
       );
 
       if (poll.status === 204) {
@@ -948,12 +1018,14 @@ class LightNovelShelf extends ComicSource {
           throw error;
         }
 
-        await this._closeHub(session);
+        const failedSession = session;
+        await this._closeHub(failedSession);
         session = null;
         assertCurrentAuth();
         this._clearSessionTokenIfOwned(
           authGeneration,
-          this._getRefreshToken(),
+          failedSession && failedSession.refreshToken,
+          failedSession && failedSession.sessionToken,
         );
 
         const result = await run(true);
@@ -1713,11 +1785,7 @@ class LightNovelShelf extends ComicSource {
 
       // GetComicContent 一次最多读取 12 页。
       // 首批用于取得总页数；其余分页在同一个 SignalR payload 中批量发送。
-      let session = null;
-
-      const loadWholeChapter = async (forceRefresh) => {
-        session = await this._openHub(forceRefresh);
-
+      const loadWholeChapter = async (session) => {
         const take = 12;
         const images = [];
         let total = 0;
@@ -1823,26 +1891,10 @@ class LightNovelShelf extends ComicSource {
         return { images: images };
       };
 
-      try {
-        try {
-          return await loadWholeChapter(false);
-        } catch (error) {
-          if (!this._isUnauthorizedError(error)) {
-            throw error;
-          }
-
-          await this._closeHub(session);
-          session = null;
-
-          this._sessionToken = "";
-          this._sessionTokenAt = 0;
-
-          return await loadWholeChapter(true);
-        }
-      } finally {
-        // 与详情页一致，后台关闭连接，不阻塞图片列表返回。
-        this._closeHub(session);
-      }
+      return await this._runHubSession(
+        "GetComicContent",
+        async (session) => await loadWholeChapter(session),
+      );
     },
 
     loadComments: async (comicId, subId, page, replyTo) => {
