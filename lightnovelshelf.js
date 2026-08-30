@@ -816,35 +816,12 @@ class LightNovelShelf extends ComicSource {
 
     session.url = hubUrl + "?id=" + encodeURIComponent(connectionToken);
 
-    // SignalR Long Polling 的第一次 GET 用于初始化 transport。
-    await this._hubTransportRequest(
-      "SignalR transport 初始化",
-      async () =>
-        await Network.get(
-          this._pollUrl(session),
-          this._pollHeaders(session),
-        ),
-    );
+    let established = false;
 
-    // Hub handshake 固定为 JSON，并以 0x1e Record Separator 结束。
-    const handshake = JSON.stringify({ protocol: "json", version: 1 }) + "\x1e";
-
-    await this._hubTransportRequest(
-      "SignalR handshake 发送",
-      async () =>
-        await Network.post(
-          session.url,
-          this._sessionAuthTextHeaders(session),
-          handshake,
-        ),
-    );
-
-    // 服务端通常在下一次 poll 返回：{}\x1e，并可能同时推送 OnMessage 公告。
-    let handshakeDone = false;
-
-    for (let i = 0; i < 6 && !handshakeDone; i++) {
-      const poll = await this._hubTransportRequest(
-        "SignalR handshake 接收",
+    try {
+      // SignalR Long Polling 的第一次 GET 用于初始化 transport。
+      await this._hubTransportRequest(
+        "SignalR transport 初始化",
         async () =>
           await Network.get(
             this._pollUrl(session),
@@ -852,26 +829,58 @@ class LightNovelShelf extends ComicSource {
           ),
       );
 
-      for (const frame of this._frames(poll.body)) {
-        if (frame.error) {
-          throw this._hubTransportError(
-            `SignalR handshake 失败: ${frame.error}`,
-          );
-        }
+      // Hub handshake 固定为 JSON，并以 0x1e Record Separator 结束。
+      const handshake = JSON.stringify({ protocol: "json", version: 1 }) + "\x1e";
 
-        if (typeof frame === "object" && Object.keys(frame).length === 0) {
-          handshakeDone = true;
-          break;
+      await this._hubTransportRequest(
+        "SignalR handshake 发送",
+        async () =>
+          await Network.post(
+            session.url,
+            this._sessionAuthTextHeaders(session),
+            handshake,
+          ),
+      );
+
+      // 服务端通常在下一次 poll 返回：{}\x1e，并可能同时推送 OnMessage 公告。
+      let handshakeDone = false;
+
+      for (let i = 0; i < 6 && !handshakeDone; i++) {
+        const poll = await this._hubTransportRequest(
+          "SignalR handshake 接收",
+          async () =>
+            await Network.get(
+              this._pollUrl(session),
+              this._pollHeaders(session),
+            ),
+        );
+
+        for (const frame of this._frames(poll.body)) {
+          if (frame.error) {
+            throw this._hubTransportError(
+              `SignalR handshake 失败: ${frame.error}`,
+            );
+          }
+
+          if (typeof frame === "object" && Object.keys(frame).length === 0) {
+            handshakeDone = true;
+            break;
+          }
         }
       }
-    }
 
-    if (!handshakeDone) {
-      throw this._hubTransportError("SignalR handshake 未收到有效响应");
-    }
+      if (!handshakeDone) {
+        throw this._hubTransportError("SignalR handshake 未收到有效响应");
+      }
 
-    session.createdAt = Date.now();
-    return session;
+      session.createdAt = Date.now();
+      established = true;
+      return session;
+    } finally {
+      if (!established) {
+        await this._closeHub(session);
+      }
+    }
   }
 
   async _closeHub(session) {
