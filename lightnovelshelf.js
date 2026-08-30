@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.10
+ * 版本：0.2.11
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -11,7 +11,7 @@
  * - SignalR Bearer Token 认证
  * - 每日自动/手动签到
  * - Long Polling 防缓存参数
- * - 整合发现页 / 漫画阅读历史 / 搜索 / 详情 / 章节 / 正文图片 / 系列评论与回复
+ * - 单连接批量发现页（12 项）/ 24 项分类分页 / 漫画阅读历史 / 搜索 / 详情 / 章节 / 正文图片 / 系列评论与回复
  *
  * 使用前：
  * 1. 在 Venera 的轻书架漫画源设置中打开账号登录。
@@ -20,10 +20,11 @@
  */
 class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
+  static categoryPageSize = 24;
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.10";
+  version = "0.2.11";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -37,10 +38,11 @@ class LightNovelShelf extends ComicSource {
   _signInInProgress = false;
   _autoSignInAttemptDate = "";
 
-  // 阅读历史仅缓存当前列表会话；第 1 页、非连续分页和退出账号时重置。
+  // 阅读历史仅缓存当前列表会话；第 1 页、非连续分页、分页大小变化和退出账号时重置。
   _historyComicIds = null;
   _historySeenSeries = new Set();
   _historyNextPage = 1;
+  _historyPageSize = 0;
   _historyRequestGeneration = 0;
 
   get apiBase() {
@@ -702,15 +704,24 @@ class LightNovelShelf extends ComicSource {
   }
 
   /**
-   * 在同一个 SignalR transport payload 中批量发送多个 Invocation，
+   * 在同一个 SignalR transport payload 中批量发送不同 Hub Method，
    * 再按 invocationId 收集可能乱序到达的 Completion。
    */
-  async _hubInvokeMany(session, target, paramsList) {
-    if (!Array.isArray(paramsList) || paramsList.length === 0) {
+  async _hubInvokeBatch(session, calls) {
+    if (!Array.isArray(calls) || calls.length === 0) {
       return [];
     }
 
-    const invocations = paramsList.map((params, index) => {
+    const invocations = calls.map((call, index) => {
+      if (
+        !call ||
+        typeof call.target !== "string" ||
+        !call.target.trim()
+      ) {
+        throw new Error(`无效 SignalR 批量调用: ${index}`);
+      }
+
+      const target = call.target.trim();
       const invocationId = String(++session.seq);
       const message =
         JSON.stringify({
@@ -718,17 +729,24 @@ class LightNovelShelf extends ComicSource {
           invocationId: invocationId,
           target: target,
           // 官方 Web 默认 UseGzip=true；这里关闭 gzip，直接返回 JSON 对象。
-          arguments: [params, { UseGzip: false }],
+          arguments: [call.params, { UseGzip: false }],
         }) + "\x1e";
 
-      return { invocationId: invocationId, index: index, message: message };
+      return {
+        invocationId: invocationId,
+        index: index,
+        target: target,
+        message: message,
+      };
     });
 
     const pending = new Map(
-      invocations.map((item) => [item.invocationId, item.index]),
+      invocations.map((item) => [item.invocationId, item]),
     );
     const results = new Array(invocations.length);
     const payload = invocations.map((item) => item.message).join("");
+    const targets = [...new Set(invocations.map((item) => item.target))];
+    const label = targets.join(", ");
 
     const send = await Network.post(
       session.url,
@@ -736,7 +754,7 @@ class LightNovelShelf extends ComicSource {
       payload,
     );
 
-    this._assertStatus(send, 200, `SignalR invoke ${target}`);
+    this._assertStatus(send, 200, `SignalR invoke ${label}`);
 
     // 通常一次 poll 会携带多个 Completion；若服务端分批推送则继续轮询。
     const maxPolls = Math.max(20, invocations.length * 2);
@@ -748,10 +766,10 @@ class LightNovelShelf extends ComicSource {
       );
 
       if (poll.status === 204) {
-        throw `SignalR 连接已关闭 (${target})`;
+        throw `SignalR 连接已关闭 (${label})`;
       }
 
-      this._assertStatus(poll, 200, `SignalR poll ${target}`);
+      this._assertStatus(poll, 200, `SignalR poll ${label}`);
 
       for (const frame of this._frames(poll.body)) {
         // type 1 = 服务端 Invocation（例如 OnMessage 公告）；type 6 = Ping。
@@ -770,16 +788,19 @@ class LightNovelShelf extends ComicSource {
         }
 
         const invocationId = String(frame.invocationId);
-        if (!pending.has(invocationId)) {
+        const invocation = pending.get(invocationId);
+        if (!invocation) {
           continue;
         }
 
         if (frame.error) {
-          throw `SignalR ${target} 调用失败: ${frame.error}`;
+          throw `SignalR ${invocation.target} 调用失败: ${frame.error}`;
         }
 
-        const index = pending.get(invocationId);
-        results[index] = this._unwrapHubResult(target, frame.result);
+        results[invocation.index] = this._unwrapHubResult(
+          invocation.target,
+          frame.result,
+        );
         pending.delete(invocationId);
       }
 
@@ -788,48 +809,72 @@ class LightNovelShelf extends ComicSource {
       }
     }
 
-    throw `等待 SignalR ${target} 返回结果超时（剩余 ${pending.size}/${invocations.length}）`;
+    throw `等待 SignalR 批量调用返回结果超时（剩余 ${pending.size}/${invocations.length}）`;
   }
 
   /**
-   * 单次 Hub 调用。
-   *
-   * 如果服务端明确返回 unauthorized，则强制刷新一次 Token、
-   * 新建 SignalR 连接并重试一次。
+   * 在同一个 SignalR transport payload 中批量发送同一 Hub Method。
    */
-  async _hubCall(target, params) {
+  async _hubInvokeMany(session, target, paramsList) {
+    if (!Array.isArray(paramsList) || paramsList.length === 0) {
+      return [];
+    }
+
+    return await this._hubInvokeBatch(
+      session,
+      paramsList.map((params) => ({ target: target, params: params })),
+    );
+  }
+
+  /**
+   * 在一个 Hub 会话中执行完整操作；明确 unauthorized 时刷新 Token 并重试一次。
+   */
+  async _runHubSession(operationName, operation) {
     let session = null;
     let succeeded = false;
 
+    const run = async (forceRefresh) => {
+      session = await this._openHub(forceRefresh);
+      return await operation(session);
+    };
+
     try {
-      session = await this._openHub(false);
-      const result = await this._hubInvoke(session, target, params);
-      succeeded = true;
-      return result;
-    } catch (error) {
-      if (!this._isUnauthorizedError(error)) {
-        throw error;
+      try {
+        const result = await run(false);
+        succeeded = true;
+        return result;
+      } catch (error) {
+        if (!this._isUnauthorizedError(error)) {
+          throw error;
+        }
+
+        await this._closeHub(session);
+        session = null;
+        this._sessionToken = "";
+        this._sessionTokenAt = 0;
+
+        const result = await run(true);
+        succeeded = true;
+        return result;
       }
-
-      await this._closeHub(session);
-      session = null;
-
-      this._sessionToken = "";
-      this._sessionTokenAt = 0;
-
-      session = await this._openHub(true);
-      const result = await this._hubInvoke(session, target, params);
-      succeeded = true;
-      return result;
     } finally {
       // 关闭请求已发出即可返回数据，不再阻塞页面等待 DELETE 响应。
       this._closeHub(session);
 
       // 签到请求本身不递归触发；后台任务不被原请求等待。
-      if (succeeded && target !== "SignIn") {
+      if (succeeded && operationName !== "SignIn") {
         this._tryAutoSignIn();
       }
     }
+  }
+
+  /**
+   * 单次 Hub 调用。
+   */
+  async _hubCall(target, params) {
+    return await this._runHubSession(target, async (session) => {
+      return await this._hubInvoke(session, target, params);
+    });
   }
 
   _value(obj, lowerName, upperName, fallback) {
@@ -1000,28 +1045,37 @@ class LightNovelShelf extends ComicSource {
     };
   }
 
-  async _loadComicList(order, page) {
-    const data = await this._hubCall("GetComicList", {
-      Page: page,
-      Size: LightNovelShelf.discoveryPageSize,
-      Order: order,
-    });
-
+  _comicListFromResponse(data) {
     const list = this._value(data, "data", "Data", []);
     const totalPages = this._value(data, "totalPages", "TotalPages", 1);
 
     return {
-      comics: (Array.isArray(list) ? list : []).map((x) =>
-        this._comicFromListItem(x),
+      comics: (Array.isArray(list) ? list : []).map((item) =>
+        this._comicFromListItem(item),
       ),
       maxPage: Number(totalPages || 1),
     };
+  }
+
+  async _loadComicList(
+    order,
+    page,
+    pageSize = LightNovelShelf.categoryPageSize,
+  ) {
+    const data = await this._hubCall("GetComicList", {
+      Page: page,
+      Size: pageSize,
+      Order: order,
+    });
+
+    return this._comicListFromResponse(data);
   }
 
   _resetReadingHistoryState() {
     this._historyComicIds = null;
     this._historySeenSeries = new Set();
     this._historyNextPage = 1;
+    this._historyPageSize = 0;
     this._historyRequestGeneration += 1;
   }
 
@@ -1032,9 +1086,30 @@ class LightNovelShelf extends ComicSource {
     return ids.filter((id) => Number.isSafeInteger(id) && id > 0);
   }
 
-  async _loadReadingHistory(page) {
+  _historyComicsFromResponse(data, seenSeries) {
+    const list = this._value(data, "data", "Data", []);
+    const comics = [];
+
+    for (const item of Array.isArray(list) ? list : []) {
+      const comic = this._comicFromListItem(item);
+      if (!comic.id || seenSeries.has(comic.id)) continue;
+
+      seenSeries.add(comic.id);
+      comics.push(comic);
+    }
+
+    return comics;
+  }
+
+  async _loadReadingHistory(
+    page,
+    pageSize = LightNovelShelf.categoryPageSize,
+  ) {
     if (!Number.isSafeInteger(page) || page < 1) {
       throw new Error("无效阅读历史页码");
+    }
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1) {
+      throw new Error("无效阅读历史分页大小");
     }
 
     const requestGeneration = ++this._historyRequestGeneration;
@@ -1047,20 +1122,22 @@ class LightNovelShelf extends ComicSource {
     const refreshHistory =
       page === 1 ||
       !Array.isArray(this._historyComicIds) ||
-      page !== this._historyNextPage;
+      page !== this._historyNextPage ||
+      pageSize !== this._historyPageSize;
+
+    let ids = this._historyComicIds;
+    let seenSeries = this._historySeenSeries;
 
     if (refreshHistory) {
       const history = await this._hubCall("GetReadHistory", {});
       assertCurrentRequest();
-      this._historyComicIds = this._historyIdsFromResponse(history);
-      this._historySeenSeries = new Set();
+      ids = this._historyIdsFromResponse(history);
+      seenSeries = new Set();
     }
 
-    const ids = this._historyComicIds;
-    const size = LightNovelShelf.discoveryPageSize;
-    const maxPage = Math.max(1, Math.ceil(ids.length / size));
-    const pageIds = ids.slice((page - 1) * size, page * size);
-    const comics = [];
+    const maxPage = Math.max(1, Math.ceil(ids.length / pageSize));
+    const pageIds = ids.slice((page - 1) * pageSize, page * pageSize);
+    let comics = [];
 
     if (pageIds.length > 0) {
       const data = await this._hubCall("GetBookListByIds", {
@@ -1068,23 +1145,130 @@ class LightNovelShelf extends ComicSource {
         Type: "Comic",
       });
       assertCurrentRequest();
-      const list = this._value(data, "data", "Data", []);
-
-      for (const item of Array.isArray(list) ? list : []) {
-        const comic = this._comicFromListItem(item);
-        if (!comic.id || this._historySeenSeries.has(comic.id)) continue;
-
-        this._historySeenSeries.add(comic.id);
-        comics.push(comic);
-      }
+      comics = this._historyComicsFromResponse(data, seenSeries);
     }
 
+    assertCurrentRequest();
+    this._historyComicIds = ids;
+    this._historySeenSeries = seenSeries;
+    this._historyPageSize = pageSize;
     this._historyNextPage = page + 1;
 
     return {
       comics: comics,
       maxPage: maxPage,
     };
+  }
+
+  async _loadDiscoveryPage() {
+    const requestGeneration = ++this._historyRequestGeneration;
+    const assertCurrentRequest = () => {
+      if (requestGeneration !== this._historyRequestGeneration) {
+        throw new Error("阅读历史请求已失效");
+      }
+    };
+
+    const loaded = await this._runHubSession(
+      "LoadDiscovery",
+      async (session) => {
+        const [latestData, popularData, historyData] =
+          await this._hubInvokeBatch(session, [
+            {
+              target: "GetComicList",
+              params: {
+                Page: 1,
+                Size: LightNovelShelf.discoveryPageSize,
+                Order: "latest",
+              },
+            },
+            {
+              target: "GetComicList",
+              params: {
+                Page: 1,
+                Size: LightNovelShelf.discoveryPageSize,
+                Order: "view",
+              },
+            },
+            { target: "GetReadHistory", params: {} },
+          ]);
+
+        assertCurrentRequest();
+        const historyIds = this._historyIdsFromResponse(historyData);
+        const pageIds = historyIds.slice(
+          0,
+          LightNovelShelf.discoveryPageSize,
+        );
+        let historyDetails = null;
+
+        if (pageIds.length > 0) {
+          historyDetails = await this._hubInvoke(
+            session,
+            "GetBookListByIds",
+            { Ids: pageIds, Type: "Comic" },
+          );
+          assertCurrentRequest();
+        }
+
+        return {
+          latestData: latestData,
+          popularData: popularData,
+          historyIds: historyIds,
+          historyDetails: historyDetails,
+        };
+      },
+    );
+
+    assertCurrentRequest();
+    const seenSeries = new Set();
+    const latest = this._comicListFromResponse(loaded.latestData);
+    const popular = this._comicListFromResponse(loaded.popularData);
+    const historyComics = loaded.historyDetails
+      ? this._historyComicsFromResponse(
+          loaded.historyDetails,
+          seenSeries,
+        )
+      : [];
+
+    this._historyComicIds = loaded.historyIds;
+    this._historySeenSeries = seenSeries;
+    this._historyNextPage = 2;
+    this._historyPageSize = LightNovelShelf.discoveryPageSize;
+
+    return [
+      {
+        title: "最近更新",
+        comics: latest.comics,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "最近更新",
+            param: "latest",
+          },
+        },
+      },
+      {
+        title: "热门漫画",
+        comics: popular.comics,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "热门漫画",
+            param: "view",
+          },
+        },
+      },
+      {
+        title: "阅读历史",
+        comics: historyComics,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "阅读历史",
+            param: "history",
+          },
+        },
+      },
+    ];
   }
 
   account = {
@@ -1107,45 +1291,7 @@ class LightNovelShelf extends ComicSource {
       title: "轻书架",
       type: "multiPartPage",
       load: async () => {
-        const latest = await this._loadComicList("latest", 1);
-        const popular = await this._loadComicList("view", 1);
-        const history = await this._loadReadingHistory(1);
-
-        return [
-          {
-            title: "最近更新",
-            comics: latest.comics,
-            viewMore: {
-              page: "category",
-              attributes: {
-                category: "最近更新",
-                param: "latest",
-              },
-            },
-          },
-          {
-            title: "热门漫画",
-            comics: popular.comics,
-            viewMore: {
-              page: "category",
-              attributes: {
-                category: "热门漫画",
-                param: "view",
-              },
-            },
-          },
-          {
-            title: "阅读历史",
-            comics: history.comics,
-            viewMore: {
-              page: "category",
-              attributes: {
-                category: "阅读历史",
-                param: "history",
-              },
-            },
-          },
-        ];
+        return await this._loadDiscoveryPage();
       },
     },
   ];
@@ -1166,13 +1312,24 @@ class LightNovelShelf extends ComicSource {
   categoryComics = {
     load: async (category, param, options, page) => {
       if (param === "latest") {
-        return await this._loadComicList("latest", page);
+        return await this._loadComicList(
+          "latest",
+          page,
+          LightNovelShelf.categoryPageSize,
+        );
       }
       if (param === "view") {
-        return await this._loadComicList("view", page);
+        return await this._loadComicList(
+          "view",
+          page,
+          LightNovelShelf.categoryPageSize,
+        );
       }
       if (param === "history") {
-        return await this._loadReadingHistory(page);
+        return await this._loadReadingHistory(
+          page,
+          LightNovelShelf.categoryPageSize,
+        );
       }
 
       throw new Error(`不支持的轻书架分类: ${category}`);
