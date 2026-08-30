@@ -33,6 +33,13 @@ class LightNovelShelf extends ComicSource {
   // 当前短期会话 Token，仅保存在当前 JS 运行实例中。
   _sessionToken = "";
   _sessionTokenAt = 0;
+  _sessionTokenGeneration = 0;
+
+  // 认证状态代际和共享刷新请求，防止旧账号响应覆盖当前会话。
+  _authGeneration = 0;
+  _refreshPromise = null;
+  _refreshPromiseGeneration = 0;
+  _refreshPromiseToken = "";
 
   // 每日签到状态：成功日期持久化，尝试日期只作用于当前 JS 实例。
   _signInInProgress = false;
@@ -321,6 +328,36 @@ class LightNovelShelf extends ComicSource {
     return String(value).trim();
   }
 
+  _invalidateAuthState() {
+    this._authGeneration += 1;
+    this._sessionToken = "";
+    this._sessionTokenAt = 0;
+    this._sessionTokenGeneration = 0;
+    this._refreshPromise = null;
+    this._refreshPromiseGeneration = 0;
+    this._refreshPromiseToken = "";
+    this._resetReadingHistoryState();
+    return this._authGeneration;
+  }
+
+  _authStateMatches(authGeneration, refreshToken) {
+    const currentRefreshToken = this.loadData("refreshToken");
+    return (
+      this._authGeneration === authGeneration &&
+      currentRefreshToken !== undefined &&
+      currentRefreshToken !== null &&
+      String(currentRefreshToken).trim() === refreshToken
+    );
+  }
+
+  _clearSessionTokenIfOwned(authGeneration, refreshToken) {
+    if (!this._authStateMatches(authGeneration, refreshToken)) return;
+
+    this._sessionToken = "";
+    this._sessionTokenAt = 0;
+    this._sessionTokenGeneration = 0;
+  }
+
   _hashPassword(password) {
     const hash = Convert.hexEncode(
       Convert.sha256(Convert.encodeUtf8(password)),
@@ -345,6 +382,7 @@ class LightNovelShelf extends ComicSource {
       throw new Error("轻书架登录失败：密码不能为空");
     }
 
+    const authGeneration = this._invalidateAuthState();
     const visitorId = this._getVisitorId();
     const passwordHash = this._hashPassword(password);
     const res = await Network.post(
@@ -400,9 +438,16 @@ class LightNovelShelf extends ComicSource {
       throw new Error("轻书架登录失败：响应缺少 RefreshToken 或 Token");
     }
 
+    if (authGeneration !== this._authGeneration) {
+      throw new Error("轻书架登录请求已失效");
+    }
+
+    // 提交新账号前再次推进认证代际，令登录期间启动的旧请求失效。
+    const committedGeneration = this._invalidateAuthState();
     this.saveData("refreshToken", refreshToken);
     this._sessionToken = sessionToken;
     this._sessionTokenAt = Date.now();
+    this._sessionTokenGeneration = committedGeneration;
 
     return email;
   }
@@ -416,93 +461,128 @@ class LightNovelShelf extends ComicSource {
    * header: x-id: visitorId
    */
   async _refreshSessionToken(force) {
-    // 避免短时间内多个首页区块同时创建连接时重复刷新。
+    const authGeneration = this._authGeneration;
+    const refreshToken = this._getRefreshToken();
+
+    // 同一认证代际和 RefreshToken 只允许一个刷新请求在途。
+    if (
+      this._refreshPromise &&
+      this._refreshPromiseGeneration === authGeneration &&
+      this._refreshPromiseToken === refreshToken
+    ) {
+      return await this._refreshPromise;
+    }
+
     if (
       !force &&
       this._sessionToken &&
+      this._sessionTokenGeneration === authGeneration &&
+      this._authStateMatches(authGeneration, refreshToken) &&
       Date.now() - this._sessionTokenAt < 15000
     ) {
       return this._sessionToken;
     }
 
-    const refreshToken = this._getRefreshToken();
     const visitorId = this._getVisitorId();
     const url = this.apiBase + "/api/user/refresh_token";
+    let refreshPromise;
 
-    const res = await Network.post(
-      url,
-      this._jsonHeaders({
-        "x-id": visitorId,
-      }),
-      JSON.stringify({
-        token: refreshToken,
-      }),
-    );
+    refreshPromise = (async () => {
+      const assertCurrentAuth = () => {
+        if (!this._authStateMatches(authGeneration, refreshToken)) {
+          throw new Error("轻书架登录状态已变更，刷新结果已失效");
+        }
+      };
 
-    if (!res || res.status !== 200) {
-      this._sessionToken = "";
-      this._sessionTokenAt = 0;
-      const status = res && res.status !== undefined ? res.status : "未知";
-      throw new Error(
-        `刷新轻书架登录状态失败: HTTP ${status}。请在 Venera 中重新登录。`,
+      const res = await Network.post(
+        url,
+        this._jsonHeaders({
+          "x-id": visitorId,
+        }),
+        JSON.stringify({
+          token: refreshToken,
+        }),
       );
-    }
+      assertCurrentAuth();
 
-    let envelope;
-    try {
-      envelope = JSON.parse(res.body);
-    } catch (_) {
-      this._sessionToken = "";
-      this._sessionTokenAt = 0;
-      throw new Error(
-        "刷新轻书架登录状态失败：服务器返回了无效 JSON。请在 Venera 中重新登录。",
-      );
-    }
-
-    // 官方 requestWithFetch 会自动解包 Success/Response/Status/Msg；
-    // Venera Network.post 返回原始响应，因此这里手动解包。
-    if (
-      envelope &&
-      typeof envelope === "object" &&
-      Object.prototype.hasOwnProperty.call(envelope, "Success")
-    ) {
-      if (!envelope.Success) {
-        this._sessionToken = "";
-        this._sessionTokenAt = 0;
-
-        const status =
-          envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
-        const message =
-          typeof envelope.Msg === "string" && envelope.Msg.trim()
-            ? `: ${envelope.Msg.trim()}`
-            : "";
+      if (!res || res.status !== 200) {
+        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        const status = res && res.status !== undefined ? res.status : "未知";
         throw new Error(
-          `轻书架登录已失效${status}${message}。请在 Venera 中重新登录。`,
+          `刷新轻书架登录状态失败: HTTP ${status}。请在 Venera 中重新登录。`,
         );
       }
 
-      envelope = envelope.Response;
+      let envelope;
+      try {
+        envelope = JSON.parse(res.body);
+      } catch (_) {
+        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        throw new Error(
+          "刷新轻书架登录状态失败：服务器返回了无效 JSON。请在 Venera 中重新登录。",
+        );
+      }
+
+      // 官方 requestWithFetch 会自动解包 Success/Response/Status/Msg；
+      // Venera Network.post 返回原始响应，因此这里手动解包。
+      if (
+        envelope &&
+        typeof envelope === "object" &&
+        Object.prototype.hasOwnProperty.call(envelope, "Success")
+      ) {
+        if (!envelope.Success) {
+          this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+
+          const status =
+            envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
+          const message =
+            typeof envelope.Msg === "string" && envelope.Msg.trim()
+              ? `: ${envelope.Msg.trim()}`
+              : "";
+          throw new Error(
+            `轻书架登录已失效${status}${message}。请在 Venera 中重新登录。`,
+          );
+        }
+
+        envelope = envelope.Response;
+      }
+
+      let token = envelope;
+
+      // 兼容服务端未来返回 { Token: "..." } 之类的对象。
+      if (token && typeof token === "object") {
+        token =
+          token.Token || token.token || token.AccessToken || token.accessToken;
+      }
+
+      if (!token || typeof token !== "string") {
+        this._clearSessionTokenIfOwned(authGeneration, refreshToken);
+        throw new Error(
+          "刷新轻书架登录状态失败：响应中没有可用的会话 Token。请在 Venera 中重新登录。",
+        );
+      }
+
+      assertCurrentAuth();
+      this._sessionToken = token;
+      this._sessionTokenAt = Date.now();
+      this._sessionTokenGeneration = authGeneration;
+
+      return token;
+    })();
+
+    this._refreshPromise = refreshPromise;
+    this._refreshPromiseGeneration = authGeneration;
+    this._refreshPromiseToken = refreshToken;
+
+    try {
+      return await refreshPromise;
+    } finally {
+      if (this._refreshPromise === refreshPromise) {
+        this._refreshPromise = null;
+        this._refreshPromiseGeneration = 0;
+        this._refreshPromiseToken = "";
+      }
     }
-
-    let token = envelope;
-
-    // 兼容服务端未来返回 { Token: "..." } 之类的对象。
-    if (token && typeof token === "object") {
-      token = token.Token || token.token || token.AccessToken || token.accessToken;
-    }
-
-    if (!token || typeof token !== "string") {
-      this._sessionToken = "";
-      this._sessionTokenAt = 0;
-      throw new Error(
-        "刷新轻书架登录状态失败：响应中没有可用的会话 Token。请在 Venera 中重新登录。",
-      );
-    }
-
-    this._sessionToken = token;
-    this._sessionTokenAt = Date.now();
-
-    return token;
   }
 
   /**
@@ -839,12 +919,22 @@ class LightNovelShelf extends ComicSource {
    * 在一个 Hub 会话中执行完整操作；明确 unauthorized 时刷新 Token 并重试一次。
    */
   async _runHubSession(operationName, operation) {
+    const authGeneration = this._authGeneration;
     let session = null;
     let succeeded = false;
 
+    const assertCurrentAuth = () => {
+      if (this._authGeneration !== authGeneration) {
+        throw new Error("轻书架登录状态已变更，请重试");
+      }
+    };
+
     const run = async (forceRefresh) => {
       session = await this._openHub(forceRefresh);
-      return await operation(session);
+      assertCurrentAuth();
+      const result = await operation(session);
+      assertCurrentAuth();
+      return result;
     };
 
     try {
@@ -853,14 +943,18 @@ class LightNovelShelf extends ComicSource {
         succeeded = true;
         return result;
       } catch (error) {
+        assertCurrentAuth();
         if (!this._isUnauthorizedError(error)) {
           throw error;
         }
 
         await this._closeHub(session);
         session = null;
-        this._sessionToken = "";
-        this._sessionTokenAt = 0;
+        assertCurrentAuth();
+        this._clearSessionTokenIfOwned(
+          authGeneration,
+          this._getRefreshToken(),
+        );
 
         const result = await run(true);
         succeeded = true;
@@ -1086,6 +1180,7 @@ class LightNovelShelf extends ComicSource {
     this._historyNextPage = 1;
     this._historyPageSize = 0;
     this._historyRequestGeneration += 1;
+    this._discoveryLoadPromise = null;
     this._discoveryLoadAuthSnapshot = null;
     this._discoveryLoadGeneration = 0;
     this._discoveryLoadInFlight = false;
@@ -1229,7 +1324,13 @@ class LightNovelShelf extends ComicSource {
     let loadPromise;
     const staleResult = () => {
       const replacement = this._discoveryLoadPromise;
-      if (replacement && replacement !== loadPromise) {
+      const currentAuthSnapshot = this.loadData("refreshToken");
+      if (
+        replacement &&
+        replacement !== loadPromise &&
+        this._discoveryLoadGeneration === this._historyRequestGeneration &&
+        this._discoveryLoadAuthSnapshot === currentAuthSnapshot
+      ) {
         return replacement;
       }
       return this._emptyDiscoveryPage();
@@ -1354,9 +1455,7 @@ class LightNovelShelf extends ComicSource {
       this.deleteData("refreshToken");
       this.deleteData("lastSignInUtcDate");
       this._autoSignInAttemptDate = "";
-      this._sessionToken = "";
-      this._sessionTokenAt = 0;
-      this._resetReadingHistoryState();
+      this._invalidateAuthState();
     },
   };
 
