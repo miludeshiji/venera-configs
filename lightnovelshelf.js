@@ -676,6 +676,46 @@ class LightNovelShelf extends ComicSource {
     });
   }
 
+  _hubTransportError(message, cause) {
+    const error = new Error(String(message));
+    error.code = "LIGHTNOVELSHELF_HUB_TRANSPORT";
+    if (cause !== undefined) error.cause = cause;
+    return error;
+  }
+
+  _isHubTransportError(error) {
+    return !!(
+      error &&
+      typeof error === "object" &&
+      error.code === "LIGHTNOVELSHELF_HUB_TRANSPORT"
+    );
+  }
+
+  async _hubTransportRequest(action, request, expected = 200) {
+    try {
+      const response = await request();
+      const accepted = Array.isArray(expected)
+        ? expected.indexOf(response && response.status) >= 0
+        : response && response.status === expected;
+
+      if (!accepted) {
+        const status =
+          response && response.status !== undefined
+            ? response.status
+            : "未知";
+        throw this._hubTransportError(`${action}失败: HTTP ${status}`);
+      }
+
+      return response;
+    } catch (error) {
+      if (this._isHubTransportError(error)) throw error;
+      const detail = String(
+        error && error.message ? error.message : error || "未知错误",
+      );
+      throw this._hubTransportError(`${action}失败: ${detail}`, error);
+    }
+  }
+
   /**
    * 建立一个已认证的 SignalR Long Polling 会话。
    *
@@ -715,92 +755,108 @@ class LightNovelShelf extends ComicSource {
       createdAt: 0,
     };
 
-    const negotiateRes = await Network.post(
-      negotiateUrl,
-      this._sessionAuthTextHeaders(session),
-      "",
+    const negotiateRes = await this._hubTransportRequest(
+      "SignalR negotiate",
+      async () =>
+        await Network.post(
+          negotiateUrl,
+          this._sessionAuthTextHeaders(session),
+          "",
+        ),
     );
-
-    this._assertStatus(negotiateRes, 200, "SignalR negotiate");
 
     let negotiate;
     try {
       negotiate = JSON.parse(negotiateRes.body);
-    } catch (_) {
-      throw "SignalR negotiate 返回了无效 JSON";
+    } catch (error) {
+      throw this._hubTransportError(
+        "SignalR negotiate 返回了无效 JSON",
+        error,
+      );
     }
 
     if (negotiate.error) {
-      throw `SignalR negotiate 失败: ${negotiate.error}`;
+      throw this._hubTransportError(
+        `SignalR negotiate 失败: ${negotiate.error}`,
+      );
     }
 
-    // 当前轻书架是自托管 Hub；暂不处理 Azure SignalR 的二次 redirect negotiate。
     if (negotiate.url) {
-      throw (
+      throw this._hubTransportError(
         "SignalR 返回了重定向地址，当前源暂未实现重定向协商: " +
-        negotiate.url
+          negotiate.url,
       );
     }
 
     const connectionToken = negotiate.connectionToken || negotiate.connectionId;
 
     if (!connectionToken) {
-      throw "SignalR negotiate 未返回 connectionToken/connectionId";
+      throw this._hubTransportError(
+        "SignalR negotiate 未返回 connectionToken/connectionId",
+      );
     }
 
     const transports = negotiate.availableTransports || [];
     const longPolling = transports.find((x) => x.transport === "LongPolling");
 
     if (!longPolling) {
-      throw "服务端没有提供 SignalR LongPolling transport";
+      throw this._hubTransportError(
+        "服务端没有提供 SignalR LongPolling transport",
+      );
     }
 
     if (
       Array.isArray(longPolling.transferFormats) &&
       longPolling.transferFormats.indexOf("Text") < 0
     ) {
-      throw "服务端 LongPolling 不支持 Text transfer format";
+      throw this._hubTransportError(
+        "服务端 LongPolling 不支持 Text transfer format",
+      );
     }
 
     session.url = hubUrl + "?id=" + encodeURIComponent(connectionToken);
 
     // SignalR Long Polling 的第一次 GET 用于初始化 transport。
-    const initRes = await Network.get(
-      this._pollUrl(session),
-      this._pollHeaders(session),
+    await this._hubTransportRequest(
+      "SignalR transport 初始化",
+      async () =>
+        await Network.get(
+          this._pollUrl(session),
+          this._pollHeaders(session),
+        ),
     );
-
-    this._assertStatus(initRes, 200, "SignalR transport 初始化");
 
     // Hub handshake 固定为 JSON，并以 0x1e Record Separator 结束。
     const handshake = JSON.stringify({ protocol: "json", version: 1 }) + "\x1e";
 
-    const sendHandshakeRes = await Network.post(
-      session.url,
-      this._sessionAuthTextHeaders(session),
-      handshake,
+    await this._hubTransportRequest(
+      "SignalR handshake 发送",
+      async () =>
+        await Network.post(
+          session.url,
+          this._sessionAuthTextHeaders(session),
+          handshake,
+        ),
     );
-
-    this._assertStatus(sendHandshakeRes, 200, "SignalR handshake 发送");
 
     // 服务端通常在下一次 poll 返回：{}\x1e，并可能同时推送 OnMessage 公告。
     let handshakeDone = false;
 
     for (let i = 0; i < 6 && !handshakeDone; i++) {
-      const poll = await Network.get(
-        this._pollUrl(session),
-        this._pollHeaders(session),
+      const poll = await this._hubTransportRequest(
+        "SignalR handshake 接收",
+        async () =>
+          await Network.get(
+            this._pollUrl(session),
+            this._pollHeaders(session),
+          ),
       );
-
-      if (poll.status === 204) {
-        throw "SignalR handshake 阶段连接已被服务端关闭";
-      }
-
-      this._assertStatus(poll, 200, "SignalR handshake 接收");
 
       for (const frame of this._frames(poll.body)) {
         if (frame.error) {
-          throw `SignalR handshake 失败: ${frame.error}`;
+          throw this._hubTransportError(
+            `SignalR handshake 失败: ${frame.error}`,
+          );
         }
 
         if (typeof frame === "object" && Object.keys(frame).length === 0) {
@@ -811,7 +867,7 @@ class LightNovelShelf extends ComicSource {
     }
 
     if (!handshakeDone) {
-      throw "SignalR handshake 未收到有效响应";
+      throw this._hubTransportError("SignalR handshake 未收到有效响应");
     }
 
     session.createdAt = Date.now();
@@ -1026,28 +1082,28 @@ class LightNovelShelf extends ComicSource {
     const targets = [...new Set(invocations.map((item) => item.target))];
     const label = targets.join(", ");
 
-    const send = await Network.post(
-      session.url,
-      this._sessionAuthTextHeaders(session),
-      payload,
+    await this._hubTransportRequest(
+      `SignalR invoke ${label}`,
+      async () =>
+        await Network.post(
+          session.url,
+          this._sessionAuthTextHeaders(session),
+          payload,
+        ),
     );
-
-    this._assertStatus(send, 200, `SignalR invoke ${label}`);
 
     // 通常一次 poll 会携带多个 Completion；若服务端分批推送则继续轮询。
     const maxPolls = Math.max(20, invocations.length * 2);
 
     for (let i = 0; i < maxPolls; i++) {
-      const poll = await Network.get(
-        this._pollUrl(session),
-        this._pollHeaders(session),
+      const poll = await this._hubTransportRequest(
+        `SignalR poll ${label}`,
+        async () =>
+          await Network.get(
+            this._pollUrl(session),
+            this._pollHeaders(session),
+          ),
       );
-
-      if (poll.status === 204) {
-        throw `SignalR 连接已关闭 (${label})`;
-      }
-
-      this._assertStatus(poll, 200, `SignalR poll ${label}`);
 
       for (const frame of this._frames(poll.body)) {
         // type 1 = 服务端 Invocation（例如 OnMessage 公告）；type 6 = Ping。
@@ -1056,9 +1112,11 @@ class LightNovelShelf extends ComicSource {
         }
 
         if (frame.type === 7) {
-          throw `SignalR 服务端关闭连接${
-            frame.error ? `: ${frame.error}` : ""
-          }`;
+          throw this._hubTransportError(
+            `SignalR 服务端关闭连接${
+              frame.error ? `: ${frame.error}` : ""
+            }`,
+          );
         }
 
         if (frame.type !== 3) {
@@ -1087,7 +1145,9 @@ class LightNovelShelf extends ComicSource {
       }
     }
 
-    throw `等待 SignalR 批量调用返回结果超时（剩余 ${pending.size}/${invocations.length}）`;
+    throw this._hubTransportError(
+      `等待 SignalR 批量调用返回结果超时（剩余 ${pending.size}/${invocations.length}）`,
+    );
   }
 
   /**
@@ -1105,16 +1165,20 @@ class LightNovelShelf extends ComicSource {
   }
 
   /**
-   * 串行租用共享 Hub 会话；明确 unauthorized 时刷新 Token 并重试一次。
+   * 串行租用共享 Hub 会话。Unauthorized 总是允许一次认证重试；
+   * 只有显式幂等读取允许一次 transport 重试，两类重试共享同一预算。
    */
-  async _runHubSession(operationName, operation) {
+  async _runHubSession(operationName, operation, options = {}) {
     const authGeneration = this._authGeneration;
+    const retryTransport = options.retryTransport === true;
     this._hubIdleGeneration += 1;
     this._hubOperationCount += 1;
 
     return await this._enqueueHubOperation(async () => {
       let session = null;
       let succeeded = false;
+      let retryCount = 0;
+      let forceRefresh = false;
 
       const assertCurrentAuth = () => {
         if (this._authGeneration !== authGeneration) {
@@ -1122,56 +1186,47 @@ class LightNovelShelf extends ComicSource {
         }
       };
 
-      const run = async (forceRefresh) => {
-        assertCurrentAuth();
-        session = await this._ensureSharedHubSession(forceRefresh);
-        assertCurrentAuth();
-        const result = await operation(session);
-        assertCurrentAuth();
-        return result;
-      };
-
       try {
-        try {
-          const result = await run(false);
-          succeeded = true;
-          return result;
-        } catch (error) {
-          assertCurrentAuth();
-          if (!this._isUnauthorizedError(error)) {
-            throw error;
-          }
-
-          const failedSession = session;
-          this._discardSharedHubSession(failedSession);
-          session = null;
-          this._clearSessionTokenIfOwned(
-            authGeneration,
-            failedSession && failedSession.refreshToken,
-            failedSession && failedSession.sessionToken,
-          );
-
+        while (true) {
           try {
-            const result = await run(true);
+            assertCurrentAuth();
+            session = null;
+            session = await this._ensureSharedHubSession(forceRefresh);
+            forceRefresh = false;
+            assertCurrentAuth();
+            const result = await operation(session);
+            assertCurrentAuth();
             succeeded = true;
             return result;
-          } catch (retryError) {
-            if (this._isUnauthorizedError(retryError)) {
-              const failedRetrySession = session;
-              this._discardSharedHubSession(failedRetrySession);
+          } catch (error) {
+            assertCurrentAuth();
+            const unauthorized = this._isUnauthorizedError(error);
+            const transport = this._isHubTransportError(error);
+            const failedSession = session;
+
+            if (unauthorized || transport) {
+              this._discardSharedHubSession(failedSession);
+            }
+            if (unauthorized) {
               this._clearSessionTokenIfOwned(
                 authGeneration,
-                failedRetrySession && failedRetrySession.refreshToken,
-                failedRetrySession && failedRetrySession.sessionToken,
+                failedSession && failedSession.refreshToken,
+                failedSession && failedSession.sessionToken,
               );
             }
-            throw retryError;
+
+            const canRetry =
+              retryCount === 0 &&
+              (unauthorized || (transport && retryTransport));
+            if (!canRetry) throw error;
+
+            retryCount += 1;
+            forceRefresh = unauthorized;
           }
         }
       } finally {
         this._hubOperationCount -= 1;
 
-        // 预热和签到本身都不能递归触发自动签到。
         if (
           succeeded &&
           operationName !== "SignIn" &&
@@ -1191,13 +1246,12 @@ class LightNovelShelf extends ComicSource {
     });
   }
 
-  /**
-   * 单次 Hub 调用。
-   */
-  async _hubCall(target, params) {
-    return await this._runHubSession(target, async (session) => {
-      return await this._hubInvoke(session, target, params);
-    });
+  async _hubCall(target, params, options = {}) {
+    return await this._runHubSession(
+      target,
+      async (session) => await this._hubInvoke(session, target, params),
+      options,
+    );
   }
 
   _value(obj, lowerName, upperName, fallback) {
@@ -1385,11 +1439,15 @@ class LightNovelShelf extends ComicSource {
     page,
     pageSize = LightNovelShelf.categoryPageSize,
   ) {
-    const data = await this._hubCall("GetComicList", {
-      Page: page,
-      Size: pageSize,
-      Order: order,
-    });
+    const data = await this._hubCall(
+      "GetComicList",
+      {
+        Page: page,
+        Size: pageSize,
+        Order: order,
+      },
+      { retryTransport: true },
+    );
 
     return this._comicListFromResponse(data);
   }
@@ -1456,7 +1514,11 @@ class LightNovelShelf extends ComicSource {
     let seenSeries = this._historySeenSeries;
 
     if (refreshHistory) {
-      const history = await this._hubCall("GetReadHistory", {});
+      const history = await this._hubCall(
+        "GetReadHistory",
+        {},
+        { retryTransport: true },
+      );
       assertCurrentRequest();
       ids = this._historyIdsFromResponse(history);
       seenSeries = new Set();
@@ -1467,10 +1529,14 @@ class LightNovelShelf extends ComicSource {
     let comics = [];
 
     if (pageIds.length > 0) {
-      const data = await this._hubCall("GetBookListByIds", {
-        Ids: pageIds,
-        Type: "Comic",
-      });
+      const data = await this._hubCall(
+        "GetBookListByIds",
+        {
+          Ids: pageIds,
+          Type: "Comic",
+        },
+        { retryTransport: true },
+      );
       assertCurrentRequest();
       comics = this._historyComicsFromResponse(data, seenSeries);
     }
@@ -1641,6 +1707,7 @@ class LightNovelShelf extends ComicSource {
           historyDetails: historyDetails,
         };
       },
+      { retryTransport: true },
     );
 
     assertCurrentRequest();
