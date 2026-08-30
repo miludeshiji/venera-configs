@@ -21,6 +21,7 @@
 class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
   static categoryPageSize = 24;
+  static hubIdleTimeoutMs = 15000;
 
   name = "轻书架";
   key = "LightNovelShelf";
@@ -57,6 +58,15 @@ class LightNovelShelf extends ComicSource {
   _discoveryLoadAuthSnapshot = null;
   _discoveryLoadGeneration = 0;
   _discoveryLoadInFlight = false;
+
+  // 单个 Long Polling session 由所有 Hub operation 串行租用。
+  _sharedHubSession = null;
+  _sharedHubOpenPromise = null;
+  _sharedHubGeneration = 0;
+  _hubOperationQueue = Promise.resolve();
+  // 包含排队中和执行中的 operation，非零时不得空闲关闭。
+  _hubOperationCount = 0;
+  _hubIdleGeneration = 0;
 
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
@@ -353,6 +363,7 @@ class LightNovelShelf extends ComicSource {
 
   _invalidateAuthState() {
     this._authGeneration += 1;
+    this._discardSharedHubSession();
     this._sessionToken = "";
     this._sessionTokenAt = 0;
     this._sessionTokenGeneration = 0;
@@ -678,6 +689,7 @@ class LightNovelShelf extends ComicSource {
   async _openHub(forceRefresh) {
     const authGeneration = this._authGeneration;
     const refreshToken = this._getRefreshToken();
+    const apiBase = this.apiBase;
     await this._refreshSessionToken(!!forceRefresh);
 
     if (
@@ -688,17 +700,19 @@ class LightNovelShelf extends ComicSource {
       throw new Error("轻书架登录状态已变更，无法建立会话");
     }
 
-    const hubUrl = this.apiBase + "/hub/api";
+    const hubUrl = apiBase + "/hub/api";
     const negotiateUrl = hubUrl + "/negotiate?negotiateVersion=1";
     const sessionToken = this._sessionToken;
     const session = {
       url: "",
       seq: 0,
       pollSeq: 0,
+      apiBase: apiBase,
       authGeneration: authGeneration,
       refreshToken: refreshToken,
       // 会话创建后始终使用此 Token，不跟随全局 Token 变化。
       sessionToken: sessionToken,
+      createdAt: 0,
     };
 
     const negotiateRes = await Network.post(
@@ -800,6 +814,7 @@ class LightNovelShelf extends ComicSource {
       throw "SignalR handshake 未收到有效响应";
     }
 
+    session.createdAt = Date.now();
     return session;
   }
 
@@ -811,6 +826,110 @@ class LightNovelShelf extends ComicSource {
     } catch (_) {
       // 关闭失败不影响已经取得的漫画数据。
     }
+  }
+
+  _sharedHubSessionMatches(session) {
+    if (!session || !session.url) return false;
+
+    const currentRefreshToken = this.loadData("refreshToken");
+    return (
+      session.apiBase === this.apiBase &&
+      session.authGeneration === this._authGeneration &&
+      currentRefreshToken !== undefined &&
+      currentRefreshToken !== null &&
+      String(currentRefreshToken).trim() === session.refreshToken &&
+      session.sessionToken === this._sessionToken &&
+      this._sessionTokenGeneration === this._authGeneration
+    );
+  }
+
+  _closeHubInBackground(session) {
+    if (!session) return;
+    const closing = this._closeHub(session);
+    if (closing && typeof closing.catch === "function") {
+      closing.catch(() => {});
+    }
+  }
+
+  _discardSharedHubSession(expectedSession = null) {
+    if (
+      expectedSession &&
+      this._sharedHubSession !== expectedSession
+    ) {
+      this._closeHubInBackground(expectedSession);
+      return;
+    }
+
+    const session = this._sharedHubSession;
+    this._sharedHubSession = null;
+    this._sharedHubOpenPromise = null;
+    this._sharedHubGeneration += 1;
+    this._hubIdleGeneration += 1;
+    this._closeHubInBackground(session);
+  }
+
+  _scheduleSharedHubClose(session) {
+    if (!session || this._sharedHubSession !== session) return;
+
+    const idleGeneration = ++this._hubIdleGeneration;
+    setTimeout(() => {
+      if (
+        idleGeneration !== this._hubIdleGeneration ||
+        this._sharedHubSession !== session ||
+        this._hubOperationCount !== 0
+      ) {
+        return;
+      }
+      this._discardSharedHubSession(session);
+    }, LightNovelShelf.hubIdleTimeoutMs);
+  }
+
+  async _ensureSharedHubSession(forceRefresh) {
+    if (forceRefresh) {
+      this._discardSharedHubSession();
+    } else if (this._sharedHubSessionMatches(this._sharedHubSession)) {
+      return this._sharedHubSession;
+    } else if (this._sharedHubSession) {
+      this._discardSharedHubSession(this._sharedHubSession);
+    }
+
+    if (!forceRefresh && this._sharedHubOpenPromise) {
+      return await this._sharedHubOpenPromise;
+    }
+
+    const sharedGeneration = this._sharedHubGeneration;
+    let openPromise;
+    openPromise = (async () => {
+      const session = await this._openHub(!!forceRefresh);
+      if (
+        sharedGeneration !== this._sharedHubGeneration ||
+        !this._sharedHubSessionMatches(session)
+      ) {
+        this._closeHubInBackground(session);
+        throw new Error("轻书架预连接已失效");
+      }
+
+      this._sharedHubSession = session;
+      return session;
+    })();
+    this._sharedHubOpenPromise = openPromise;
+
+    try {
+      return await openPromise;
+    } finally {
+      if (this._sharedHubOpenPromise === openPromise) {
+        this._sharedHubOpenPromise = null;
+      }
+    }
+  }
+
+  _enqueueHubOperation(operation) {
+    const queued = this._hubOperationQueue.then(operation, operation);
+    this._hubOperationQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
   }
 
   _unwrapHubResult(target, envelope) {
@@ -986,61 +1105,90 @@ class LightNovelShelf extends ComicSource {
   }
 
   /**
-   * 在一个 Hub 会话中执行完整操作；明确 unauthorized 时刷新 Token 并重试一次。
+   * 串行租用共享 Hub 会话；明确 unauthorized 时刷新 Token 并重试一次。
    */
   async _runHubSession(operationName, operation) {
     const authGeneration = this._authGeneration;
-    let session = null;
-    let succeeded = false;
+    this._hubIdleGeneration += 1;
+    this._hubOperationCount += 1;
 
-    const assertCurrentAuth = () => {
-      if (this._authGeneration !== authGeneration) {
-        throw new Error("轻书架登录状态已变更，请重试");
-      }
-    };
+    return await this._enqueueHubOperation(async () => {
+      let session = null;
+      let succeeded = false;
 
-    const run = async (forceRefresh) => {
-      session = await this._openHub(forceRefresh);
-      assertCurrentAuth();
-      const result = await operation(session);
-      assertCurrentAuth();
-      return result;
-    };
+      const assertCurrentAuth = () => {
+        if (this._authGeneration !== authGeneration) {
+          throw new Error("轻书架登录状态已变更，请重试");
+        }
+      };
 
-    try {
-      try {
-        const result = await run(false);
-        succeeded = true;
-        return result;
-      } catch (error) {
+      const run = async (forceRefresh) => {
         assertCurrentAuth();
-        if (!this._isUnauthorizedError(error)) {
-          throw error;
+        session = await this._ensureSharedHubSession(forceRefresh);
+        assertCurrentAuth();
+        const result = await operation(session);
+        assertCurrentAuth();
+        return result;
+      };
+
+      try {
+        try {
+          const result = await run(false);
+          succeeded = true;
+          return result;
+        } catch (error) {
+          assertCurrentAuth();
+          if (!this._isUnauthorizedError(error)) {
+            throw error;
+          }
+
+          const failedSession = session;
+          this._discardSharedHubSession(failedSession);
+          session = null;
+          this._clearSessionTokenIfOwned(
+            authGeneration,
+            failedSession && failedSession.refreshToken,
+            failedSession && failedSession.sessionToken,
+          );
+
+          try {
+            const result = await run(true);
+            succeeded = true;
+            return result;
+          } catch (retryError) {
+            if (this._isUnauthorizedError(retryError)) {
+              const failedRetrySession = session;
+              this._discardSharedHubSession(failedRetrySession);
+              this._clearSessionTokenIfOwned(
+                authGeneration,
+                failedRetrySession && failedRetrySession.refreshToken,
+                failedRetrySession && failedRetrySession.sessionToken,
+              );
+            }
+            throw retryError;
+          }
+        }
+      } finally {
+        this._hubOperationCount -= 1;
+
+        // 预热和签到本身都不能递归触发自动签到。
+        if (
+          succeeded &&
+          operationName !== "SignIn" &&
+          operationName !== "Prewarm"
+        ) {
+          this._tryAutoSignIn();
         }
 
-        const failedSession = session;
-        await this._closeHub(failedSession);
-        session = null;
-        assertCurrentAuth();
-        this._clearSessionTokenIfOwned(
-          authGeneration,
-          failedSession && failedSession.refreshToken,
-          failedSession && failedSession.sessionToken,
-        );
-
-        const result = await run(true);
-        succeeded = true;
-        return result;
+        if (
+          session &&
+          this._sharedHubSession === session &&
+          this._hubOperationCount === 0
+        ) {
+          this._scheduleSharedHubClose(session);
+        }
       }
-    } finally {
-      // 关闭请求已发出即可返回数据，不再阻塞页面等待 DELETE 响应。
-      this._closeHub(session);
-
-      // 签到请求本身不递归触发；后台任务不被原请求等待。
-      if (succeeded && operationName !== "SignIn") {
-        this._tryAutoSignIn();
-      }
-    }
+    });
   }
 
   /**
@@ -1516,6 +1664,18 @@ class LightNovelShelf extends ComicSource {
       popular.comics,
       historyComics,
     );
+  }
+
+  init() {
+    if (!this.isLogged) return;
+
+    const prewarm = this._runHubSession(
+      "Prewarm",
+      async () => null,
+    );
+    if (prewarm && typeof prewarm.catch === "function") {
+      prewarm.catch(() => {});
+    }
   }
 
   account = {
