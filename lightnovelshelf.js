@@ -45,6 +45,12 @@ class LightNovelShelf extends ComicSource {
   _historyPageSize = 0;
   _historyRequestGeneration = 0;
 
+  // 发现页刷新期间复用同一请求；失效请求只允许把替代请求的结果返回给 UI。
+  _discoveryLoadPromise = null;
+  _discoveryLoadAuthSnapshot = null;
+  _discoveryLoadGeneration = 0;
+  _discoveryLoadInFlight = false;
+
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
   }
@@ -154,8 +160,11 @@ class LightNovelShelf extends ComicSource {
   }
 
   _isUnauthorizedError(error) {
-    const text = String(error || "").toLowerCase();
+    const text = String(
+      error && error.message ? error.message : error || "",
+    ).toLowerCase();
     return (
+      /\bhttp\s*(?:status\s*)?(?:401|403)\b/.test(text) ||
       text.includes("user is unauthorized") ||
       text.includes("unauthorized") ||
       text.includes("未授权") ||
@@ -1077,6 +1086,9 @@ class LightNovelShelf extends ComicSource {
     this._historyNextPage = 1;
     this._historyPageSize = 0;
     this._historyRequestGeneration += 1;
+    this._discoveryLoadAuthSnapshot = null;
+    this._discoveryLoadGeneration = 0;
+    this._discoveryLoadInFlight = false;
   }
 
   _historyIdsFromResponse(data) {
@@ -1160,8 +1172,100 @@ class LightNovelShelf extends ComicSource {
     };
   }
 
-  async _loadDiscoveryPage() {
+  _discoveryPageParts(latest, popular, history) {
+    return [
+      {
+        title: "最近更新",
+        comics: latest,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "最近更新",
+            param: "latest",
+          },
+        },
+      },
+      {
+        title: "热门漫画",
+        comics: popular,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "热门漫画",
+            param: "view",
+          },
+        },
+      },
+      {
+        title: "阅读历史",
+        comics: history,
+        viewMore: {
+          page: "category",
+          attributes: {
+            category: "阅读历史",
+            param: "history",
+          },
+        },
+      },
+    ];
+  }
+
+  _emptyDiscoveryPage() {
+    return this._discoveryPageParts([], [], []);
+  }
+
+  _loadDiscoveryPage() {
+    const authSnapshot = this.loadData("refreshToken");
+    if (
+      this._discoveryLoadInFlight &&
+      this._discoveryLoadGeneration === this._historyRequestGeneration &&
+      this._discoveryLoadAuthSnapshot === authSnapshot
+    ) {
+      return this._discoveryLoadPromise;
+    }
+
     const requestGeneration = ++this._historyRequestGeneration;
+    const request = this._loadDiscoveryPageRequest(requestGeneration);
+    let loadPromise;
+    const staleResult = () => {
+      const replacement = this._discoveryLoadPromise;
+      if (replacement && replacement !== loadPromise) {
+        return replacement;
+      }
+      return this._emptyDiscoveryPage();
+    };
+
+    loadPromise = request.then(
+      (result) => {
+        if (requestGeneration !== this._historyRequestGeneration) {
+          return staleResult();
+        }
+        return result;
+      },
+      (error) => {
+        if (requestGeneration !== this._historyRequestGeneration) {
+          return staleResult();
+        }
+        throw error;
+      },
+    );
+
+    this._discoveryLoadPromise = loadPromise;
+    this._discoveryLoadAuthSnapshot = authSnapshot;
+    this._discoveryLoadGeneration = requestGeneration;
+    this._discoveryLoadInFlight = true;
+
+    const clearInFlight = () => {
+      if (this._discoveryLoadPromise === loadPromise) {
+        this._discoveryLoadInFlight = false;
+      }
+    };
+    loadPromise.then(clearInFlight, clearInFlight);
+
+    return loadPromise;
+  }
+
+  async _loadDiscoveryPageRequest(requestGeneration) {
     const assertCurrentRequest = () => {
       if (requestGeneration !== this._historyRequestGeneration) {
         throw new Error("阅读历史请求已失效");
@@ -1234,41 +1338,11 @@ class LightNovelShelf extends ComicSource {
     this._historyNextPage = 2;
     this._historyPageSize = LightNovelShelf.discoveryPageSize;
 
-    return [
-      {
-        title: "最近更新",
-        comics: latest.comics,
-        viewMore: {
-          page: "category",
-          attributes: {
-            category: "最近更新",
-            param: "latest",
-          },
-        },
-      },
-      {
-        title: "热门漫画",
-        comics: popular.comics,
-        viewMore: {
-          page: "category",
-          attributes: {
-            category: "热门漫画",
-            param: "view",
-          },
-        },
-      },
-      {
-        title: "阅读历史",
-        comics: historyComics,
-        viewMore: {
-          page: "category",
-          attributes: {
-            category: "阅读历史",
-            param: "history",
-          },
-        },
-      },
-    ];
+    return this._discoveryPageParts(
+      latest.comics,
+      popular.comics,
+      historyComics,
+    );
   }
 
   account = {
