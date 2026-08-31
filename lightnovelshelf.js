@@ -23,6 +23,8 @@ class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
   static categoryPageSize = 24;
   static hubIdleTimeoutMs = 15000;
+  static hubNoReplayMessage =
+    "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
 
   name = "轻书架";
   key = "LightNovelShelf";
@@ -692,6 +694,13 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
+  _hubNoReplayError(cause) {
+    const error = new Error(LightNovelShelf.hubNoReplayMessage);
+    error.code = "LIGHTNOVELSHELF_HUB_NO_REPLAY";
+    if (cause !== undefined) error.cause = cause;
+    return error;
+  }
+
   async _hubTransportRequest(action, request, expected = 200) {
     try {
       const response = await request();
@@ -755,8 +764,25 @@ class LightNovelShelf extends ComicSource {
       sessionToken: sessionToken,
       createdAt: 0,
     };
+    const clearRejectedToken = (error) => {
+      if (this._isUnauthorizedError(error)) {
+        this._clearSessionTokenIfOwned(
+          authGeneration,
+          refreshToken,
+          sessionToken,
+        );
+      }
+      return error;
+    };
+    const openingRequest = async (action, request, expected = 200) => {
+      try {
+        return await this._hubTransportRequest(action, request, expected);
+      } catch (error) {
+        throw clearRejectedToken(error);
+      }
+    };
 
-    const negotiateRes = await this._hubTransportRequest(
+    const negotiateRes = await openingRequest(
       "SignalR negotiate",
       async () =>
         await Network.post(
@@ -777,8 +803,10 @@ class LightNovelShelf extends ComicSource {
     }
 
     if (negotiate.error) {
-      throw this._hubTransportError(
-        `SignalR negotiate 失败: ${negotiate.error}`,
+      throw clearRejectedToken(
+        this._hubTransportError(
+          `SignalR negotiate 失败: ${negotiate.error}`,
+        ),
       );
     }
 
@@ -821,7 +849,7 @@ class LightNovelShelf extends ComicSource {
 
     try {
       // SignalR Long Polling 的第一次 GET 用于初始化 transport。
-      await this._hubTransportRequest(
+      await openingRequest(
         "SignalR transport 初始化",
         async () =>
           await Network.get(
@@ -833,7 +861,7 @@ class LightNovelShelf extends ComicSource {
       // Hub handshake 固定为 JSON，并以 0x1e Record Separator 结束。
       const handshake = JSON.stringify({ protocol: "json", version: 1 }) + "\x1e";
 
-      await this._hubTransportRequest(
+      await openingRequest(
         "SignalR handshake 发送",
         async () =>
           await Network.post(
@@ -847,7 +875,7 @@ class LightNovelShelf extends ComicSource {
       let handshakeDone = false;
 
       for (let i = 0; i < 6 && !handshakeDone; i++) {
-        const poll = await this._hubTransportRequest(
+        const poll = await openingRequest(
           "SignalR handshake 接收",
           async () =>
             await Network.get(
@@ -858,8 +886,10 @@ class LightNovelShelf extends ComicSource {
 
         for (const frame of this._frames(poll.body)) {
           if (frame.error) {
-            throw this._hubTransportError(
-              `SignalR handshake 失败: ${frame.error}`,
+            throw clearRejectedToken(
+              this._hubTransportError(
+                `SignalR handshake 失败: ${frame.error}`,
+              ),
             );
           }
 
@@ -1228,7 +1258,10 @@ class LightNovelShelf extends ComicSource {
             const canRetry =
               retryCount === 0 &&
               (unauthorized || (transport && retryTransport));
-            if (!canRetry) throw error;
+            if (!canRetry) {
+              if (transport) throw this._hubNoReplayError(error);
+              throw error;
+            }
 
             retryCount += 1;
             forceRefresh = unauthorized;
