@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.15
+ * 版本：0.2.16
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -30,7 +30,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.15";
+  version = "0.2.16";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -1870,6 +1870,7 @@ class LightNovelShelf extends ComicSource {
     logout: () => {
       this.deleteData("account");
       this.deleteData("refreshToken");
+      this.deleteData("visitorId");
       this.deleteData("lastSignInUtcDate");
       this._autoSignInAttemptDate = "";
       this._invalidateAuthState();
