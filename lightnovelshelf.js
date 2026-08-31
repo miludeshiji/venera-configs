@@ -1,12 +1,12 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.13
+ * 版本：0.2.14
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
  * - HTTP Long Polling transport
- * - 邮箱密码登录并自动管理认证令牌
+ * - 邮箱密码 / RefreshToken+x-id 登录并自动管理认证令牌
  * - RefreshToken -> session Token 自动刷新
  * - SignalR Bearer Token 认证
  * - 每日自动/手动签到
@@ -15,9 +15,9 @@
  * - 漫画阅读历史 / 搜索 / 详情 / 章节 / 正文图片 / 系列评论与回复
  *
  * 使用前：
- * 1. 在 Venera 的轻书架漫画源设置中打开账号登录。
- * 2. 使用轻书架注册邮箱和密码登录。
- * 3. x-id 与令牌由漫画源自动生成和管理。
+ * 1. 邮箱登录：在 Venera 账号区域输入轻书架邮箱和密码。
+ * 2. Token 登录：在源设置中填入 RefreshToken 和 x-id，点击“Token 登录”。
+ * 3. Token 登录成功后，设置中的两个敏感输入会自动清空。
  */
 class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
@@ -28,7 +28,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.13";
+  version = "0.2.14";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
