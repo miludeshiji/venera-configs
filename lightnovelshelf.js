@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.14
+ * 版本：0.2.15
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -16,8 +16,8 @@
  *
  * 使用前：
  * 1. 邮箱登录：在 Venera 账号区域输入轻书架邮箱和密码。
- * 2. Token 登录：在源设置中填入 RefreshToken 和 x-id，点击“Token 登录”。
- * 3. Token 登录成功后，设置中的两个敏感输入会自动清空。
+ * 2. Token 登录：点击源设置底部的“Token 登录”，输入 RefreshToken|x-id。
+ * 3. 支持使用 ， , ； ; 或 | 分隔 RefreshToken 和 x-id。
  */
 class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
@@ -30,7 +30,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.14";
+  version = "0.2.15";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。

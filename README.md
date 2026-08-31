@@ -32,16 +32,13 @@
    - 源文件地址：`https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js`
 2. 选择一种登录方式：
    - 邮箱登录：打开账号登录，输入轻书架注册邮箱和密码。
-   - Token 登录：在源设置中填写 `RefreshToken` 和 `x-id`，点击“Token 登录”。
-3. Token 登录成功后，源会自动清空设置中的 `RefreshToken` 和 `x-id` 输入；认证数据仍保存在 Venera 源数据中供后续刷新使用。
+   - Token 登录：点击源设置底部、邮箱登录上方的“Token 登录”，在弹窗中输入 `RefreshToken|x-id`。也可使用 `，`、`,`、`；` 或 `;` 分隔。
 
 ## 设置
 
 | 设置 | 作用 | 默认值 |
 | --- | --- | --- |
-| RefreshToken | Token 登录使用的长期令牌；成功后自动清空输入 | 空 |
-| x-id | Token 登录使用的设备标识；成功后自动清空输入 | 空 |
-| Token 登录 | 校验并保存 RefreshToken 与 x-id | 按需使用 |
+| Token 登录 | 弹窗输入 RefreshToken 和 x-id，支持 `，`、`,`、`；`、`;`、`|` 分隔 | 按需使用 |
 | API 线路 | 在 `HK / 默认` 与 `Cloudflare` 线路之间切换 | `HK / 默认` |
 | 搜索时忽略日文原文 | 从搜索结果中过滤日文原文 | 关闭 |
 | 搜索时忽略 AI 内容 | 从搜索结果中过滤 AI 内容 | 关闭 |
