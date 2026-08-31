@@ -325,12 +325,16 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
-  _getVisitorId() {
-    const saved = this.loadData("visitorId");
-    const normalizedSaved = String(saved == null ? "" : saved)
+  _normalizeVisitorId(value) {
+    return String(value == null ? "" : value)
       .trim()
       .replace(/-/g, "")
       .toLowerCase();
+  }
+
+  _getVisitorId() {
+    const saved = this.loadData("visitorId");
+    const normalizedSaved = this._normalizeVisitorId(saved);
 
     if (/^[0-9a-f]{32}$/.test(normalizedSaved)) {
       if (saved !== normalizedSaved) {
@@ -339,10 +343,7 @@ class LightNovelShelf extends ComicSource {
       return normalizedSaved;
     }
 
-    const generated = String(createUuid())
-      .trim()
-      .replace(/-/g, "")
-      .toLowerCase();
+    const generated = this._normalizeVisitorId(createUuid());
 
     if (!/^[0-9a-f]{32}$/.test(generated)) {
       throw new Error("生成轻书架设备标识失败");
@@ -500,6 +501,137 @@ class LightNovelShelf extends ComicSource {
     return email;
   }
 
+  async _requestSessionToken(refreshToken, visitorId, action) {
+    let res;
+    try {
+      res = await Network.post(
+        this.apiBase + "/api/user/refresh_token",
+        this._jsonHeaders({
+          "x-id": visitorId,
+        }),
+        JSON.stringify({
+          token: refreshToken,
+        }),
+      );
+    } catch (_) {
+      throw new Error(`${action}失败：网络请求失败`);
+    }
+
+    if (!res || res.status !== 200) {
+      const status = res && res.status !== undefined ? res.status : "未知";
+      throw new Error(`${action}失败: HTTP ${status}`);
+    }
+
+    let envelope;
+    try {
+      envelope = JSON.parse(res.body);
+    } catch (_) {
+      throw new Error(`${action}失败：服务器返回了无效 JSON`);
+    }
+
+    if (
+      envelope &&
+      typeof envelope === "object" &&
+      Object.prototype.hasOwnProperty.call(envelope, "Success")
+    ) {
+      if (!envelope.Success) {
+        const status =
+          envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
+        const message =
+          typeof envelope.Msg === "string" && envelope.Msg.trim()
+            ? `: ${envelope.Msg.trim()}`
+            : "";
+        throw new Error(`${action}失败${status}${message}`);
+      }
+      envelope = envelope.Response;
+    }
+
+    let token = envelope;
+    if (token && typeof token === "object") {
+      token =
+        token.Token || token.token || token.AccessToken || token.accessToken;
+    }
+
+    if (typeof token !== "string" || !token.trim()) {
+      throw new Error(`${action}失败：响应中没有可用的会话 Token`);
+    }
+
+    return token.trim();
+  }
+
+  _clearTokenLoginSettings() {
+    const settings = this.loadData("settings");
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      return;
+    }
+
+    const hasRefreshToken = Object.prototype.hasOwnProperty.call(
+      settings,
+      "tokenRefreshToken",
+    );
+    const hasVisitorId = Object.prototype.hasOwnProperty.call(
+      settings,
+      "tokenVisitorId",
+    );
+    if (!hasRefreshToken && !hasVisitorId) return;
+
+    const cleared = Object.assign({}, settings);
+    cleared.tokenRefreshToken = "";
+    cleared.tokenVisitorId = "";
+    this.saveData("settings", cleared);
+  }
+
+  async _loginWithToken(refreshTokenValue, visitorIdValue) {
+    const refreshToken = String(
+      refreshTokenValue == null ? "" : refreshTokenValue,
+    ).trim();
+    const visitorId = this._normalizeVisitorId(visitorIdValue);
+
+    if (!refreshToken) {
+      throw new Error("轻书架 Token 登录失败：RefreshToken 不能为空");
+    }
+    if (!/^[0-9a-f]{32}$/.test(visitorId)) {
+      throw new Error("轻书架 Token 登录失败：x-id 必须为 32 位十六进制字符串");
+    }
+
+    const authGeneration = this._authGeneration;
+    const sessionToken = await this._requestSessionToken(
+      refreshToken,
+      visitorId,
+      "轻书架 Token 登录",
+    );
+
+    if (authGeneration !== this._authGeneration) {
+      throw new Error("轻书架 Token 登录请求已失效");
+    }
+
+    const committedGeneration = this._invalidateAuthState();
+    this.saveData("visitorId", visitorId);
+    this.saveData("refreshToken", refreshToken);
+    this.deleteData("lastSignInUtcDate");
+    this._autoSignInAttemptDate = "";
+    this._sessionToken = sessionToken;
+    this._sessionTokenAt = Date.now();
+    this._sessionTokenGeneration = committedGeneration;
+    this.saveData("account", "token");
+    this._clearTokenLoginSettings();
+    return "ok";
+  }
+
+  async _loginWithTokenSettings() {
+    try {
+      const result = await this._loginWithToken(
+        this.loadSetting("tokenRefreshToken"),
+        this.loadSetting("tokenVisitorId"),
+      );
+      UI.showMessage("Token 登录成功");
+      return result;
+    } catch (_) {
+      UI.showMessage("Token 登录失败，请检查 RefreshToken 和 x-id");
+      return null;
+    }
+  }
+
   /**
    * 使用长期 RefreshToken 换取 SignalR 使用的短期会话 Token。
    *
@@ -533,7 +665,6 @@ class LightNovelShelf extends ComicSource {
     }
 
     const visitorId = this._getVisitorId();
-    const url = this.apiBase + "/api/user/refresh_token";
     let refreshPromise;
 
     refreshPromise = (async () => {
@@ -543,96 +674,29 @@ class LightNovelShelf extends ComicSource {
         }
       };
 
-      const res = await Network.post(
-        url,
-        this._jsonHeaders({
-          "x-id": visitorId,
-        }),
-        JSON.stringify({
-          token: refreshToken,
-        }),
-      );
-      assertCurrentAuth();
-
-      if (!res || res.status !== 200) {
-        this._clearSessionTokenIfOwned(
-          authGeneration,
-          refreshToken,
-          ownedSessionToken,
-        );
-        const status = res && res.status !== undefined ? res.status : "未知";
-        throw new Error(
-          `刷新轻书架登录状态失败: HTTP ${status}。请在 Venera 中重新登录。`,
-        );
-      }
-
-      let envelope;
       try {
-        envelope = JSON.parse(res.body);
-      } catch (_) {
+        const token = await this._requestSessionToken(
+          refreshToken,
+          visitorId,
+          "刷新轻书架登录状态",
+        );
+        assertCurrentAuth();
+        this._sessionToken = token;
+        this._sessionTokenAt = Date.now();
+        this._sessionTokenGeneration = authGeneration;
+        return token;
+      } catch (error) {
+        assertCurrentAuth();
         this._clearSessionTokenIfOwned(
           authGeneration,
           refreshToken,
           ownedSessionToken,
         );
-        throw new Error(
-          "刷新轻书架登录状态失败：服务器返回了无效 JSON。请在 Venera 中重新登录。",
-        );
+        const detail = String(
+          error && error.message ? error.message : error || "未知错误",
+        ).replace(/[。.]+$/, "");
+        throw new Error(`${detail}。请在 Venera 中重新登录。`);
       }
-
-      // 官方 requestWithFetch 会自动解包 Success/Response/Status/Msg；
-      // Venera Network.post 返回原始响应，因此这里手动解包。
-      if (
-        envelope &&
-        typeof envelope === "object" &&
-        Object.prototype.hasOwnProperty.call(envelope, "Success")
-      ) {
-        if (!envelope.Success) {
-          this._clearSessionTokenIfOwned(
-            authGeneration,
-            refreshToken,
-            ownedSessionToken,
-          );
-
-          const status =
-            envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
-          const message =
-            typeof envelope.Msg === "string" && envelope.Msg.trim()
-              ? `: ${envelope.Msg.trim()}`
-              : "";
-          throw new Error(
-            `轻书架登录已失效${status}${message}。请在 Venera 中重新登录。`,
-          );
-        }
-
-        envelope = envelope.Response;
-      }
-
-      let token = envelope;
-
-      // 兼容服务端未来返回 { Token: "..." } 之类的对象。
-      if (token && typeof token === "object") {
-        token =
-          token.Token || token.token || token.AccessToken || token.accessToken;
-      }
-
-      if (!token || typeof token !== "string") {
-        this._clearSessionTokenIfOwned(
-          authGeneration,
-          refreshToken,
-          ownedSessionToken,
-        );
-        throw new Error(
-          "刷新轻书架登录状态失败：响应中没有可用的会话 Token。请在 Venera 中重新登录。",
-        );
-      }
-
-      assertCurrentAuth();
-      this._sessionToken = token;
-      this._sessionTokenAt = Date.now();
-      this._sessionTokenGeneration = authGeneration;
-
-      return token;
     })();
 
     this._refreshPromise = refreshPromise;
@@ -1794,8 +1858,10 @@ class LightNovelShelf extends ComicSource {
     },
 
     logout: () => {
+      this.deleteData("account");
       this.deleteData("refreshToken");
       this.deleteData("lastSignInUtcDate");
+      this._clearTokenLoginSettings();
       this._autoSignInAttemptDate = "";
       this._invalidateAuthState();
     },
@@ -2345,6 +2411,27 @@ class LightNovelShelf extends ComicSource {
   };
 
   settings = {
+    tokenRefreshToken: {
+      title: "RefreshToken",
+      type: "input",
+      validator: null,
+      default: "",
+    },
+
+    tokenVisitorId: {
+      title: "x-id",
+      type: "input",
+      validator: null,
+      default: "",
+    },
+
+    tokenLogin: {
+      title: "Token 登录",
+      type: "callback",
+      buttonText: "登录",
+      callback: async () => await this._loginWithTokenSettings(),
+    },
+
     apiServer: {
       title: "API 线路",
       type: "select",
