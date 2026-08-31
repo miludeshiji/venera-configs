@@ -2011,7 +2011,7 @@ class LightNovelShelf extends ComicSource {
       const tagMap = {};
       const author = this._value(series, "author", "Author", "") || "";
       const authors = String(author)
-        .split("、")
+        .split(/、|×|\bx\b/i)
         .map((name) => name.trim())
         .filter(Boolean);
       const originalTitle =
