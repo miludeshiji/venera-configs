@@ -25,6 +25,8 @@ class LightNovelShelf extends ComicSource {
   static hubIdleTimeoutMs = 15000;
   static hubNoReplayMessage =
     "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
+  static tokenLoginFormatError =
+    "请输入 RefreshToken 和 x-id，并用 ， , ； ; 或 | 分隔";
 
   name = "轻书架";
   key = "LightNovelShelf";
@@ -559,26 +561,20 @@ class LightNovelShelf extends ComicSource {
     return token.trim();
   }
 
-  _clearTokenLoginSettings() {
-    const settings = this.loadData("settings");
-    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
-      return;
+  _parseTokenLoginInput(value) {
+    const parts = String(value == null ? "" : value)
+      .trim()
+      .split(/[，,；;|]/)
+      .map((part) => part.trim());
+
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      throw new Error(LightNovelShelf.tokenLoginFormatError);
     }
 
-    const hasRefreshToken = Object.prototype.hasOwnProperty.call(
-      settings,
-      "tokenRefreshToken",
-    );
-    const hasVisitorId = Object.prototype.hasOwnProperty.call(
-      settings,
-      "tokenVisitorId",
-    );
-    if (!hasRefreshToken && !hasVisitorId) return;
-
-    const cleared = Object.assign({}, settings);
-    cleared.tokenRefreshToken = "";
-    cleared.tokenVisitorId = "";
-    this.saveData("settings", cleared);
+    return {
+      refreshToken: parts[0],
+      visitorId: parts[1],
+    };
   }
 
   async _loginWithToken(refreshTokenValue, visitorIdValue) {
@@ -614,15 +610,29 @@ class LightNovelShelf extends ComicSource {
     this._sessionTokenAt = Date.now();
     this._sessionTokenGeneration = committedGeneration;
     this.saveData("account", "token");
-    this._clearTokenLoginSettings();
     return "ok";
   }
 
-  async _loginWithTokenSettings() {
+  async _loginWithTokenDialog() {
+    const value = await UI.showInputDialog(
+      "Token 登录：输入 RefreshToken|x-id",
+      (input) => {
+        try {
+          this._parseTokenLoginInput(input);
+          return null;
+        } catch (_) {
+          return LightNovelShelf.tokenLoginFormatError;
+        }
+      },
+    );
+
+    if (value === null) return null;
+
     try {
+      const input = this._parseTokenLoginInput(value);
       const result = await this._loginWithToken(
-        this.loadSetting("tokenRefreshToken"),
-        this.loadSetting("tokenVisitorId"),
+        input.refreshToken,
+        input.visitorId,
       );
       UI.showMessage("Token 登录成功");
       return result;
@@ -1861,7 +1871,6 @@ class LightNovelShelf extends ComicSource {
       this.deleteData("account");
       this.deleteData("refreshToken");
       this.deleteData("lastSignInUtcDate");
-      this._clearTokenLoginSettings();
       this._autoSignInAttemptDate = "";
       this._invalidateAuthState();
     },
@@ -2411,27 +2420,6 @@ class LightNovelShelf extends ComicSource {
   };
 
   settings = {
-    tokenRefreshToken: {
-      title: "RefreshToken",
-      type: "input",
-      validator: null,
-      default: "",
-    },
-
-    tokenVisitorId: {
-      title: "x-id",
-      type: "input",
-      validator: null,
-      default: "",
-    },
-
-    tokenLogin: {
-      title: "Token 登录",
-      type: "callback",
-      buttonText: "登录",
-      callback: async () => await this._loginWithTokenSettings(),
-    },
-
     apiServer: {
       title: "API 线路",
       type: "select",
@@ -2471,6 +2459,13 @@ class LightNovelShelf extends ComicSource {
       type: "callback",
       buttonText: "签到",
       callback: () => this.dailySignIn(false),
+    },
+
+    tokenLogin: {
+      title: "Token 登录",
+      type: "callback",
+      buttonText: "登录",
+      callback: async () => await this._loginWithTokenDialog(),
     },
   };
 }
