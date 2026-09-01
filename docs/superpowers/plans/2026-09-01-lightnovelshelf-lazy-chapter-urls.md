@@ -237,12 +237,14 @@ test("concurrent pages in one batch share one content request", async () => {
   const source = createHarness();
   const gate = deferred();
   const calls = [];
+  let holdBatch = false;
   attachContentHub(source, async (_target, params) => {
     calls.push(params);
-    if (params.Skip === 6) await gate.promise;
+    if (holdBatch && params.Skip === 6) await gate.promise;
     return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "7");
+  holdBatch = true;
   calls.length = 0;
 
   const page7 = source.comic.onImageLoad(result.images[6], "series", "7");
