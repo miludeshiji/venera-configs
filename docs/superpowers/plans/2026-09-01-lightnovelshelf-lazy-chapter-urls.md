@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 将轻书架章节正文改为首批探测总页数、Venera 实际加载图片时再按 12 页取得对应 URL，避免直接跳到末页时请求中间批次。
+**Goal:** 将轻书架章节正文改为首批探测总页数、Venera 实际加载图片时再按 6 页取得对应 URL，避免直接跳到末页时请求中间批次。
 
-**Architecture:** `loadEp` 只探测首批并返回与总页数等长的稳定虚拟图片键；异步 `onImageLoad` 将虚拟键映射到目标页所在的 `GetComicContent` 批次，再返回实际图片 URL。实例级、认证与 API 线路隔离的三章节 LRU Promise 缓存负责合并相同批次并发请求、保留已解析 URL，并在失败或认证失效后允许安全重试。
+**Architecture:** `loadEp` 只探测首批并返回与总页数等长的稳定虚拟图片键；异步 `onImageLoad` 只将当前被请求的虚拟键映射到其 6 页 `GetComicContent` 批次，再返回实际图片 URL，不在源侧额外预取相邻批次。实例级、认证与 API 线路隔离的三章节 LRU Promise 缓存负责合并相同批次并发请求、保留已解析 URL，并在失败或认证失效后允许安全重试。
 
 **Tech Stack:** JavaScript ComicSource API、Venera/VeneraNext `loadEp`/`onImageLoad`、ASP.NET Core SignalR JSON Hub Protocol、HTTP Long Polling、Node.js `vm`/`node:test`、Git
 
@@ -16,7 +16,8 @@
 - Modify: `index.json` — 同步轻书架 `0.2.17` 版本和按需章节 URL 功能描述。
 - Create temporarily: `test/lightnovelshelf-lazy-chapter-urls.test.cjs` — 隔离式按需加载、并发、失效、LRU 和错误回归测试；最终删除，不进入提交。
 - Reference only: `docs/superpowers/specs/2026-09-01-lightnovelshelf-lazy-chapter-urls-design.md` — 已批准设计。
-- Reference only: `cache/Flutter/lib/features/reader/comic_reader_screen.dart`、`reader_comic_paging.dart` — 官方 App 的 12 页按需策略。
+- Reference only: `https://github.com/LightNovelShelf/Web/commit/56896742c33a6b21911aee4b50a8a21337414cd1` — 新版网页的 6 页正文批次、后向 URL 窗口和后续 4 张图片预加载策略。
+- Reference only: `cache/Flutter/lib/features/reader/comic_reader_screen.dart`、`reader_comic_paging.dart` — 官方 App 稀疏页面与按需批次架构；其中旧的 12 页常量不再作为服务端批次依据。
 - Reference only: `cache/Venera-Next/lib/features/comic_source/parser.dart`、`lib/network/images.dart`、`lib/features/reader/images.dart` — 异步 `onImageLoad`、URL 替换和图片预加载契约。
 
 只修改上述两个正式发布文件。保持 `lightnovelshelf.js` 的 CRLF 工作区行尾；禁止整文件格式化。临时测试目录已被 `.gitignore` 忽略，任何提交都不得包含 `test/`、`cache/` 或用户已有改动。
@@ -141,7 +142,7 @@ async function spinUntil(predicate, message = "condition not reached") {
 }
 
 function comicBatch(chapterId, skip, total, options = {}) {
-  const count = Math.max(0, Math.min(12, total - skip));
+  const count = Math.max(0, Math.min(6, total - skip));
   const images = Array.from(
     { length: count },
     (_, offset) => `/images/${chapterId}/${skip + offset}.jpg`,
@@ -178,16 +179,16 @@ test("loadEp only probes the first batch and returns stable page keys", async ()
   attachContentHub(source, async (target, params) => {
     assert.equal(target, "GetComicContent");
     calls.push(params);
-    return comicBatch(params.Cid, params.Skip, 25);
+    return comicBatch(params.Cid, params.Skip, 13);
   });
 
   const result = await source.comic.loadEp("series", "7");
 
-  assert.deepEqual(calls, [{ Cid: 7, Skip: 0, Take: 12 }]);
-  assert.equal(result.images.length, 25);
+  assert.deepEqual(calls, [{ Cid: 7, Skip: 0, Take: 6 }]);
+  assert.equal(result.images.length, 13);
   assert.deepEqual(
     plain(result.images),
-    Array.from({ length: 25 }, (_, page) => expectedKey(7, page)),
+    Array.from({ length: 13 }, (_, page) => expectedKey(7, page)),
   );
 });
 
@@ -196,19 +197,19 @@ test("jumping to the final page requests only its batch", async () => {
   const calls = [];
   attachContentHub(source, async (_target, params) => {
     calls.push(params);
-    return comicBatch(params.Cid, params.Skip, 25);
+    return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "7");
   calls.length = 0;
 
   const config = await source.comic.onImageLoad(
-    result.images[24],
+    result.images[12],
     "series",
     "7",
   );
 
-  assert.deepEqual(calls, [{ Cid: 7, Skip: 24, Take: 12 }]);
-  assert.equal(config.url, "https://api.lightnovel.life/images/7/24.jpg");
+  assert.deepEqual(calls, [{ Cid: 7, Skip: 12, Take: 6 }]);
+  assert.equal(config.url, "https://api.lightnovel.life/images/7/12.jpg");
   assert.equal(config.headers.Referer, "https://www.lightnovel.app/");
 });
 
@@ -217,7 +218,7 @@ test("first batch page URLs reuse the loadEp probe", async () => {
   const calls = [];
   attachContentHub(source, async (_target, params) => {
     calls.push(params);
-    return comicBatch(params.Cid, params.Skip, 25);
+    return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "7");
   calls.length = 0;
@@ -238,30 +239,30 @@ test("concurrent pages in one batch share one content request", async () => {
   const calls = [];
   attachContentHub(source, async (_target, params) => {
     calls.push(params);
-    if (params.Skip === 12) await gate.promise;
-    return comicBatch(params.Cid, params.Skip, 25);
+    if (params.Skip === 6) await gate.promise;
+    return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "7");
   calls.length = 0;
 
-  const page13 = source.comic.onImageLoad(result.images[12], "series", "7");
-  const page14 = source.comic.onImageLoad(result.images[13], "series", "7");
+  const page7 = source.comic.onImageLoad(result.images[6], "series", "7");
+  const page8 = source.comic.onImageLoad(result.images[7], "series", "7");
   await spinUntil(
-    () => calls.filter((call) => call.Skip === 12).length === 1,
+    () => calls.filter((call) => call.Skip === 6).length === 1,
     "shared batch request did not start",
   );
-  assert.equal(calls.filter((call) => call.Skip === 12).length, 1);
+  assert.equal(calls.filter((call) => call.Skip === 6).length, 1);
 
   gate.resolve();
-  const configs = await Promise.all([page13, page14]);
+  const configs = await Promise.all([page7, page8]);
   assert.deepEqual(
     plain(configs.map((config) => config.url)),
     [
-      "https://api.lightnovel.life/images/7/12.jpg",
-      "https://api.lightnovel.life/images/7/13.jpg",
+      "https://api.lightnovel.life/images/7/6.jpg",
+      "https://api.lightnovel.life/images/7/7.jpg",
     ],
   );
-  assert.equal(calls.filter((call) => call.Skip === 12).length, 1);
+  assert.equal(calls.filter((call) => call.Skip === 6).length, 1);
 });
 
 test("non-placeholder image URLs preserve pass-through behavior", async () => {
@@ -286,7 +287,7 @@ Run:
 node --test test/lightnovelshelf-lazy-chapter-urls.test.cjs
 ```
 
-Expected: FAIL。首个测试应观察到当前实现还请求 `Skip: 12`、`Skip: 24`；图片配置测试还没有虚拟键对应的 `url`。失败必须来自尚未实现的按需行为，而不是测试宿主语法或加载错误。
+Expected: FAIL。首个测试应观察到当前实现还请求 `Skip: 6`、`Skip: 12`；图片配置测试还没有虚拟键对应的 `url`。失败必须来自尚未实现的按需行为，而不是测试宿主语法或加载错误。
 
 ### Task 2: 实现虚拟键和核心按需批次
 
@@ -300,7 +301,7 @@ Expected: FAIL。首个测试应观察到当前实现还请求 `Skip: 12`、`Ski
 在 `LightNovelShelf` 静态字段中加入：
 
 ```javascript
-  static comicContentPageSize = 12;
+  static comicContentPageSize = 6;
   static comicPageKeyPrefix = "lightnovelshelf-page://";
 ```
 
@@ -317,7 +318,7 @@ Expected: FAIL。首个测试应观察到当前实现还请求 `Skip: 12`、`Ski
 在 Hub 状态字段之后加入：
 
 ```javascript
-  // 章节正文按章节和 12 页批次缓存共享 Promise。
+  // 章节正文按章节和 6 页批次缓存共享 Promise。
   _comicContentStates = new Map();
 ```
 
@@ -547,7 +548,7 @@ Expected: FAIL。首个测试应观察到当前实现还请求 `Skip: 12`、`Ski
     },
 ```
 
-`onThumbnailLoad` 保持不变。
+`onThumbnailLoad` 保持不变。不得从 `onImageLoad` 主动调用上一批或下一批；Venera 的实际图片键请求是唯一的正文批次触发器。
 
 - [ ] **Step 5: 运行核心测试并确认 GREEN**
 
@@ -588,25 +589,25 @@ test("failed batches are removed so image retry sends a new request", async () =
   const source = createHarness();
   let attempts = 0;
   attachContentHub(source, async (_target, params) => {
-    if (params.Skip === 12 && attempts++ === 0) {
+    if (params.Skip === 6 && attempts++ === 0) {
       throw new Error("temporary failure");
     }
-    return comicBatch(params.Cid, params.Skip, 25);
+    return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "8");
 
   await assert.rejects(
-    source.comic.onImageLoad(result.images[12], "series", "8"),
+    source.comic.onImageLoad(result.images[6], "series", "8"),
     /temporary failure/,
   );
   const config = await source.comic.onImageLoad(
-    result.images[12],
+    result.images[6],
     "series",
     "8",
   );
 
   assert.equal(attempts, 2);
-  assert.equal(config.url, "https://api.lightnovel.life/images/8/12.jpg");
+  assert.equal(config.url, "https://api.lightnovel.life/images/8/6.jpg");
 });
 
 test("auth invalidation clears previously resolved chapter batches", async () => {
@@ -614,7 +615,7 @@ test("auth invalidation clears previously resolved chapter batches", async () =>
   const calls = [];
   attachContentHub(source, async (_target, params) => {
     calls.push(params);
-    return comicBatch(params.Cid, params.Skip, 12);
+    return comicBatch(params.Cid, params.Skip, 6);
   });
   const result = await source.comic.loadEp("series", "9");
   calls.length = 0;
@@ -626,7 +627,7 @@ test("auth invalidation clears previously resolved chapter batches", async () =>
     "9",
   );
 
-  assert.deepEqual(calls, [{ Cid: 9, Skip: 0, Take: 12 }]);
+  assert.deepEqual(calls, [{ Cid: 9, Skip: 0, Take: 6 }]);
   assert.equal(config.url, "https://api.lightnovel.life/images/9/0.jpg");
 });
 
@@ -635,7 +636,7 @@ test("API line changes do not reuse old chapter batches", async () => {
   const calls = [];
   attachContentHub(source, async (_target, params) => {
     calls.push({ apiBase: source.apiBase, ...params });
-    return comicBatch(params.Cid, params.Skip, 12);
+    return comicBatch(params.Cid, params.Skip, 6);
   });
   const result = await source.comic.loadEp("series", "10");
   calls.length = 0;
@@ -652,7 +653,7 @@ test("API line changes do not reuse old chapter batches", async () => {
       apiBase: "https://cf-api.lightnovel.life",
       Cid: 10,
       Skip: 0,
-      Take: 12,
+      Take: 6,
     },
   ]);
   assert.equal(
@@ -664,7 +665,7 @@ test("API line changes do not reuse old chapter batches", async () => {
 test("chapter state cache keeps the three most recently used contexts", async () => {
   const source = createHarness();
   attachContentHub(source, async (_target, params) =>
-    comicBatch(params.Cid, params.Skip, 12),
+    comicBatch(params.Cid, params.Skip, 6),
   );
 
   const chapter1 = await source.comic.loadEp("series", "1");
@@ -685,7 +686,7 @@ test("chapter state cache keeps the three most recently used contexts", async ()
 test("placeholder validation rejects malformed or mismatched page keys", async () => {
   const source = createHarness();
   attachContentHub(source, async (_target, params) =>
-    comicBatch(params.Cid, params.Skip, 12),
+    comicBatch(params.Cid, params.Skip, 6),
   );
   const result = await source.comic.loadEp("series", "11");
 
@@ -702,7 +703,7 @@ test("placeholder validation rejects malformed or mismatched page keys", async (
     /与当前章节不匹配/,
   );
   await assert.rejects(
-    source.comic.onImageLoad(expectedKey(11, 12), "series", "11"),
+    source.comic.onImageLoad(expectedKey(11, 6), "series", "11"),
     /页码越界/,
   );
   await assert.rejects(source.comic.loadEp("series", "0"), /无效章节 ID/);
@@ -748,37 +749,37 @@ test("incomplete and inconsistent batches fail without being cached", async () =
   const source = createHarness();
   let incomplete = true;
   attachContentHub(source, async (_target, params) => {
-    if (params.Skip === 12 && incomplete) {
+    if (params.Skip === 6 && incomplete) {
       incomplete = false;
-      return comicBatch(params.Cid, params.Skip, 25, { dropLast: true });
+      return comicBatch(params.Cid, params.Skip, 13, { dropLast: true });
     }
-    return comicBatch(params.Cid, params.Skip, 25);
+    return comicBatch(params.Cid, params.Skip, 13);
   });
   const result = await source.comic.loadEp("series", "13");
 
   await assert.rejects(
-    source.comic.onImageLoad(result.images[12], "series", "13"),
+    source.comic.onImageLoad(result.images[6], "series", "13"),
     /章节分页数据不完整/,
   );
   const recovered = await source.comic.onImageLoad(
-    result.images[12],
+    result.images[6],
     "series",
     "13",
   );
   assert.equal(
     recovered.url,
-    "https://api.lightnovel.life/images/13/12.jpg",
+    "https://api.lightnovel.life/images/13/6.jpg",
   );
 
   source._comicContentStates.clear();
   attachContentHub(source, async (_target, params) =>
     params.Skip === 0
-      ? comicBatch(params.Cid, params.Skip, 25)
-      : comicBatch(params.Cid, params.Skip, 26),
+      ? comicBatch(params.Cid, params.Skip, 13)
+      : comicBatch(params.Cid, params.Skip, 14),
   );
   const inconsistent = await source.comic.loadEp("series", "14");
   await assert.rejects(
-    source.comic.onImageLoad(inconsistent.images[24], "series", "14"),
+    source.comic.onImageLoad(inconsistent.images[12], "series", "14"),
     /章节总页数发生变化/,
   );
 });
@@ -991,9 +992,9 @@ Expected: 临时测试已删除；工作区相对已完成提交无未提交正�
 
 在交付说明中准确记录：Node 宿主已验证 `loadEp -> 虚拟键 -> onImageLoad -> 单批实际 URL` 的完整脚本行为；若当前环境没有已登录的 Venera/VeneraNext 实例，则未声称完成真实账号网络或旧 Venera 实机检查。可用实机时执行：
 
-1. 打开超过 24 页的章节；
+1. 打开超过 12 页的章节；
 2. 直接跳到最后一页；
 3. 查看网络日志只有 `Skip: 0` 和末批 `Skip`，没有中间值；
-4. 顺序跨越 12 页边界，确认每个新批次只请求一次；
+4. 顺序跨越 6 页边界，确认每个新批次只请求一次；
 5. 切换章节与瀑布流跨章，确认图片正常显示；
 6. 切换 API 线路或重新登录，确认旧批次不复用。
