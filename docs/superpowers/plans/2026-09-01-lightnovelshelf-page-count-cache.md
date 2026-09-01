@@ -104,15 +104,20 @@
 - Delete: `test/lightnovelshelf-page-count-cache.test.cjs`
 
 - [ ] 将脚本和索引版本同步到 `0.2.18`，描述加入“复用章节 PageCount”。
-- [ ] 运行：
+- [ ] 运行行为、语法、JSON 和 CRLF 检查：
 
 ```bash
 node --test test/lightnovelshelf-page-count-cache.test.cjs
 node --check lightnovelshelf.js
 node -e "JSON.parse(require('node:fs').readFileSync('index.json','utf8')); console.log('index ok')"
-node scripts/validate-pr-versions.js HEAD
+git -c core.whitespace=cr-at-eol diff --check
+```
+
+- [ ] 提交 `lightnovelshelf.js` 和 `index.json` 后运行：
+
+```bash
+node scripts/validate-pr-versions.js HEAD~1
 ```
 
 - [ ] 预期所有测试通过、输出 `index ok` 和 `Version validation passed for 1 config file(s).`。
-- [ ] 使用 `git -c core.whitespace=cr-at-eol diff --check` 验证 CRLF 文件没有真实尾随空格。
-- [ ] 提交正式文件，删除忽略目录中的临时测试。
+- [ ] 删除忽略目录中的临时测试。
