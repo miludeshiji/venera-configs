@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.16
+ * 版本：0.2.17
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -22,6 +22,8 @@
 class LightNovelShelf extends ComicSource {
   static discoveryPageSize = 12;
   static categoryPageSize = 24;
+  static comicContentPageSize = 6;
+  static comicPageKeyPrefix = "lightnovelshelf-page://";
   static hubIdleTimeoutMs = 15000;
   static hubNoReplayMessage =
     "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
@@ -30,7 +32,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.16";
+  version = "0.2.17";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -72,6 +74,9 @@ class LightNovelShelf extends ComicSource {
   // 包含排队中和执行中的 operation，非零时不得空闲关闭。
   _hubOperationCount = 0;
   _hubIdleGeneration = 0;
+
+  // 章节正文按章节和 6 页批次缓存共享 Promise。
+  _comicContentStates = new Map();
 
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
@@ -1385,6 +1390,149 @@ class LightNovelShelf extends ComicSource {
     return fallback;
   }
 
+  _comicChapterId(value) {
+    const chapterId = Number(value);
+    return Number.isSafeInteger(chapterId) && chapterId > 0
+      ? chapterId
+      : null;
+  }
+
+  _encodeComicPageKey(chapterId, page) {
+    if (
+      this._comicChapterId(chapterId) === null ||
+      !Number.isSafeInteger(page) ||
+      page < 0
+    ) {
+      throw new Error("无效轻书架章节图片键");
+    }
+    return `${LightNovelShelf.comicPageKeyPrefix}${chapterId}/${page}`;
+  }
+
+  _parseComicPageKey(value) {
+    if (
+      typeof value !== "string" ||
+      !value.startsWith(LightNovelShelf.comicPageKeyPrefix)
+    ) {
+      return null;
+    }
+
+    const match = value
+      .slice(LightNovelShelf.comicPageKeyPrefix.length)
+      .match(/^([1-9]\d*)\/(0|[1-9]\d*)$/);
+    if (!match) {
+      throw new Error("无效轻书架章节图片键");
+    }
+
+    const chapterId = Number(match[1]);
+    const page = Number(match[2]);
+    if (
+      this._comicChapterId(chapterId) === null ||
+      !Number.isSafeInteger(page)
+    ) {
+      throw new Error("无效轻书架章节图片键");
+    }
+    return { chapterId: chapterId, page: page };
+  }
+
+  _getComicContentState(chapterId) {
+    let state = this._comicContentStates.get(chapterId);
+    if (!state) {
+      state = {
+        chapterId: chapterId,
+        total: null,
+        batches: new Map(),
+      };
+      this._comicContentStates.set(chapterId, state);
+    }
+    return state;
+  }
+
+  _comicContentBatchFromResponse(data, requestedSkip) {
+    const chapter = this._value(data, "chapter", "Chapter", null);
+    if (!chapter || typeof chapter !== "object") {
+      throw new Error("GetComicContent 未返回 chapter/Chapter");
+    }
+
+    const imagesRaw = this._value(chapter, "images", "Images", null);
+    const total = Number(this._value(chapter, "total", "Total", NaN));
+    const reportedSkip = this._value(chapter, "skip", "Skip", null);
+    if (!Array.isArray(imagesRaw) || !Number.isSafeInteger(total) || total < 0) {
+      throw new Error("章节分页响应格式异常");
+    }
+    if (
+      !Number.isSafeInteger(requestedSkip) ||
+      requestedSkip < 0 ||
+      requestedSkip % LightNovelShelf.comicContentPageSize !== 0 ||
+      (total === 0 ? requestedSkip !== 0 : requestedSkip >= total)
+    ) {
+      throw new Error(`章节分页位置异常: Skip ${requestedSkip}`);
+    }
+    if (
+      reportedSkip !== null &&
+      reportedSkip !== undefined &&
+      Number(reportedSkip) !== requestedSkip
+    ) {
+      throw new Error(
+        `章节分页位置不匹配: 请求 ${requestedSkip}，响应 ${reportedSkip}`,
+      );
+    }
+
+    const expectedCount =
+      total === 0
+        ? 0
+        : Math.min(LightNovelShelf.comicContentPageSize, total - requestedSkip);
+    if (imagesRaw.length !== expectedCount) {
+      throw new Error(
+        `章节分页数据不完整: Skip ${requestedSkip}, 预期 ${expectedCount} 页，实际 ${imagesRaw.length} 页`,
+      );
+    }
+
+    const images = imagesRaw.map((image) => {
+      if (typeof image !== "string" || !image.trim()) {
+        throw new Error(`章节分页包含无效图片: Skip ${requestedSkip}`);
+      }
+      return this._normalizeUrl(image.trim());
+    });
+    return { skip: requestedSkip, total: total, images: images };
+  }
+
+  async _loadComicContentBatch(chapterId, skip) {
+    const state = this._getComicContentState(chapterId);
+    const existing = state.batches.get(skip);
+    if (existing) return await existing;
+
+    let batchPromise;
+    batchPromise = (async () => {
+      const data = await this._hubCall(
+        "GetComicContent",
+        {
+          Cid: chapterId,
+          Skip: skip,
+          Take: LightNovelShelf.comicContentPageSize,
+        },
+        { retryTransport: true },
+      );
+      const batch = this._comicContentBatchFromResponse(data, skip);
+      if (state.total !== null && state.total !== batch.total) {
+        throw new Error(
+          `章节总页数发生变化: 原 ${state.total} 页，现 ${batch.total} 页`,
+        );
+      }
+      state.total = batch.total;
+      return batch;
+    })();
+    state.batches.set(skip, batchPromise);
+
+    try {
+      return await batchPromise;
+    } catch (error) {
+      if (state.batches.get(skip) === batchPromise) {
+        state.batches.delete(skip);
+      }
+      throw error;
+    }
+  }
+
   _positiveCommentInteger(value) {
     const number = Number(value);
     return Number.isSafeInteger(number) && number > 0 ? number : null;
@@ -2123,124 +2271,21 @@ class LightNovelShelf extends ComicSource {
     },
 
     loadEp: async (comicId, epId) => {
-      const cid = Number(epId);
-
-      if (!Number.isFinite(cid)) {
-        throw `无效章节 ID: ${epId}`;
+      const chapterId = this._comicChapterId(epId);
+      if (chapterId === null) {
+        throw new Error(`无效章节 ID: ${epId}`);
       }
 
-      // GetComicContent 一次最多读取 12 页。
-      // 首批用于取得总页数；其余分页在同一个 SignalR payload 中批量发送。
-      const loadWholeChapter = async (session) => {
-        const take = 12;
-        const images = [];
-        let total = 0;
+      const firstBatch = await this._loadComicContentBatch(chapterId, 0);
+      if (firstBatch.total === 0 || firstBatch.images.length === 0) {
+        throw new Error("该章节未返回任何图片");
+      }
 
-        const appendBatch = (data) => {
-          const chapter = this._value(data, "chapter", "Chapter", null);
-
-          if (!chapter) {
-            throw "GetComicContent 未返回 chapter/Chapter";
-          }
-
-          const imagesRaw = this._value(chapter, "images", "Images", []);
-          const batch = Array.isArray(imagesRaw) ? imagesRaw : [];
-          const reportedTotal = Number(
-            this._value(chapter, "total", "Total", 0) || 0,
-          );
-
-          if (reportedTotal > 0) {
-            total = reportedTotal;
-          }
-
-          for (const image of batch) {
-            images.push(this._normalizeUrl(image));
-          }
-
-          return batch;
-        };
-
-        let batch = appendBatch(
-          await this._hubInvoke(session, "GetComicContent", {
-            Cid: cid,
-            Skip: 0,
-            Take: take,
-          }),
-        );
-        let skip = batch.length;
-        const initialTotal = total;
-
-        if (batch.length === take && initialTotal > skip) {
-          const remainingBatchCount = Math.ceil(
-            (initialTotal - skip) / take,
-          );
-
-          if (remainingBatchCount > 499) {
-            throw `章节分页数量异常: ${remainingBatchCount} 批`;
-          }
-
-          const paramsList = [];
-
-          for (
-            let nextSkip = skip;
-            nextSkip < initialTotal;
-            nextSkip += take
-          ) {
-            paramsList.push({ Cid: cid, Skip: nextSkip, Take: take });
-          }
-
-          const remaining = await this._hubInvokeMany(
-            session,
-            "GetComicContent",
-            paramsList,
-          );
-
-          for (let index = 0; index < remaining.length; index++) {
-            const params = paramsList[index];
-            const currentBatch = appendBatch(remaining[index]);
-            const expectedCount = Math.min(
-              take,
-              initialTotal - params.Skip,
-            );
-
-            if (currentBatch.length !== expectedCount) {
-              throw `章节分页数据不完整: Skip ${params.Skip}, 预期 ${expectedCount} 页，实际 ${currentBatch.length} 页`;
-            }
-          }
-        } else {
-          // 服务端未返回可靠总页数或首批不足 12 页时，保留串行兼容路径。
-          for (let batchIndex = 1; batchIndex < 500; batchIndex++) {
-            if (batch.length === 0) break;
-            if (total > 0 && skip >= total) break;
-            if (total <= 0 && batch.length < take) break;
-
-            batch = appendBatch(
-              await this._hubInvoke(session, "GetComicContent", {
-                Cid: cid,
-                Skip: skip,
-                Take: take,
-              }),
-            );
-            skip += batch.length;
-          }
-        }
-
-        if (!images.length) {
-          throw "该章节未返回任何图片";
-        }
-
-        const expectedTotal = initialTotal > 0 ? initialTotal : total;
-        if (expectedTotal > 0 && images.length !== expectedTotal) {
-          throw `章节图片数量不完整: 预期 ${expectedTotal} 页，实际 ${images.length} 页`;
-        }
-
-        return { images: images };
+      return {
+        images: Array.from({ length: firstBatch.total }, (_, page) =>
+          this._encodeComicPageKey(chapterId, page),
+        ),
       };
-
-      return await this._runHubSession(
-        "GetComicContent",
-        async (session) => await loadWholeChapter(session),
-      );
     },
 
     loadComments: async (comicId, subId, page, replyTo) => {
@@ -2379,13 +2424,39 @@ class LightNovelShelf extends ComicSource {
       return "ok";
     },
 
-    onImageLoad: (url, comicId, epId) => {
-      return {
-        headers: {
-          "User-Agent": this.userAgent,
-          Referer: this.siteBase + "/",
-        },
+    onImageLoad: async (url, comicId, epId) => {
+      const headers = {
+        "User-Agent": this.userAgent,
+        Referer: this.siteBase + "/",
       };
+      const reference = this._parseComicPageKey(url);
+      if (!reference) {
+        return { url: url, headers: headers };
+      }
+
+      const chapterId = this._comicChapterId(epId);
+      if (chapterId === null || chapterId !== reference.chapterId) {
+        throw new Error("轻书架章节图片键与当前章节不匹配");
+      }
+
+      const state = this._getComicContentState(chapterId);
+      if (state.total !== null && reference.page >= state.total) {
+        throw new Error("轻书架章节图片页码越界");
+      }
+
+      const skip =
+        Math.floor(reference.page / LightNovelShelf.comicContentPageSize) *
+        LightNovelShelf.comicContentPageSize;
+      const batch = await this._loadComicContentBatch(chapterId, skip);
+      if (reference.page >= batch.total) {
+        throw new Error("轻书架章节图片页码越界");
+      }
+
+      const actualUrl = batch.images[reference.page - skip];
+      if (!actualUrl) {
+        throw new Error("轻书架章节图片页码越界");
+      }
+      return { url: actualUrl, headers: headers };
     },
 
     onThumbnailLoad: (url) => {
