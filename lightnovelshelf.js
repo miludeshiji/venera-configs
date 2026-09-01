@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.17
+ * 版本：0.2.18
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -33,7 +33,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.17";
+  version = "0.2.18";
   minAppVersion = "1.0.0";
 
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
@@ -78,6 +78,7 @@ class LightNovelShelf extends ComicSource {
 
   // 章节正文按章节和 6 页批次缓存共享 Promise。
   _comicContentStates = new Map();
+  _comicChapterPageCounts = new Map();
   _comicContentUseSequence = 0;
 
   get apiBase() {
@@ -1439,11 +1440,16 @@ class LightNovelShelf extends ComicSource {
 
   _clearComicContentStates() {
     this._comicContentStates.clear();
+    this._comicChapterPageCounts.clear();
     this._comicContentUseSequence = 0;
   }
 
-  _comicContentStateKey(chapterId) {
-    return `${this.apiBase}\n${this._authGeneration}\n${chapterId}`;
+  _comicContentStateKey(
+    chapterId,
+    apiBase = this.apiBase,
+    authGeneration = this._authGeneration,
+  ) {
+    return `${apiBase}\n${authGeneration}\n${chapterId}`;
   }
 
   _touchComicContentState(key, state) {
@@ -1482,6 +1488,20 @@ class LightNovelShelf extends ComicSource {
     }
     this._touchComicContentState(key, state);
     return state;
+  }
+
+  _knownComicPageCount(chapterId) {
+    const state = this._getComicContentState(chapterId);
+    if (state.total !== null) return state.total;
+
+    const pageCount = this._comicChapterPageCounts.get(
+      this._comicContentStateKey(chapterId),
+    );
+    if (Number.isSafeInteger(pageCount) && pageCount >= 0) {
+      state.total = pageCount;
+      return pageCount;
+    }
+    return null;
   }
 
   _comicContentBatchFromResponse(data, requestedSkip) {
@@ -2174,6 +2194,8 @@ class LightNovelShelf extends ComicSource {
 
   comic = {
     loadInfo: async (id) => {
+      const pageCountApiBase = this.apiBase;
+      const pageCountAuthGeneration = this._authGeneration;
       const data = await this._hubCall("GetComicSeriesInfo", {
         SeriesTitle: id,
         Order: "latest",
@@ -2182,6 +2204,7 @@ class LightNovelShelf extends ComicSource {
       const series = this._value(data, "series", "Series", null);
       const booksRaw = this._value(data, "books", "Books", []);
       const books = Array.isArray(booksRaw) ? booksRaw : [];
+      const chapterPageCounts = new Map();
 
       if (!series) {
         throw "GetComicSeriesInfo 未返回 series/Series";
@@ -2255,6 +2278,24 @@ class LightNovelShelf extends ComicSource {
           const sortNum = this._value(chapter, "sortNum", "SortNum", "");
           const chapterTitle = this._value(chapter, "title", "Title", "");
           const chapterName = chapterTitle || `第 ${sortNum} 话`;
+          const normalizedChapterId = this._comicChapterId(chapterId);
+          const pageCount = Number(
+            this._value(chapter, "pageCount", "PageCount", NaN),
+          );
+          if (
+            normalizedChapterId !== null &&
+            Number.isSafeInteger(pageCount) &&
+            pageCount >= 0
+          ) {
+            chapterPageCounts.set(
+              this._comicContentStateKey(
+                normalizedChapterId,
+                pageCountApiBase,
+                pageCountAuthGeneration,
+              ),
+              pageCount,
+            );
+          }
 
           if (chapterId !== "" && chapterId !== null && chapterId !== undefined) {
             const id = String(chapterId);
@@ -2301,6 +2342,13 @@ class LightNovelShelf extends ComicSource {
         tagMap["原名"] = [String(originalTitle)];
       }
 
+      if (
+        pageCountApiBase === this.apiBase &&
+        pageCountAuthGeneration === this._authGeneration
+      ) {
+        this._comicChapterPageCounts = chapterPageCounts;
+      }
+
       return {
         title: String(this._value(series, "title", "Title", id) || id),
         subTitle: originalTitle || author || "",
@@ -2323,13 +2371,16 @@ class LightNovelShelf extends ComicSource {
         throw new Error(`无效章节 ID: ${epId}`);
       }
 
-      const firstBatch = await this._loadComicContentBatch(chapterId, 0);
-      if (firstBatch.total === 0 || firstBatch.images.length === 0) {
+      let total = this._knownComicPageCount(chapterId);
+      if (total === null) {
+        total = (await this._loadComicContentBatch(chapterId, 0)).total;
+      }
+      if (total === 0) {
         throw new Error("该章节未返回任何图片");
       }
 
       return {
-        images: Array.from({ length: firstBatch.total }, (_, page) =>
+        images: Array.from({ length: total }, (_, page) =>
           this._encodeComicPageKey(chapterId, page),
         ),
       };
