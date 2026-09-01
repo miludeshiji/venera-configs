@@ -24,6 +24,7 @@ class LightNovelShelf extends ComicSource {
   static categoryPageSize = 24;
   static comicContentPageSize = 6;
   static comicPageKeyPrefix = "lightnovelshelf-page://";
+  static comicContentStateLimit = 3;
   static hubIdleTimeoutMs = 15000;
   static hubNoReplayMessage =
     "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
@@ -77,6 +78,7 @@ class LightNovelShelf extends ComicSource {
 
   // 章节正文按章节和 6 页批次缓存共享 Promise。
   _comicContentStates = new Map();
+  _comicContentUseSequence = 0;
 
   get apiBase() {
     return this.loadSetting("apiServer") || "https://api.lightnovel.life";
@@ -375,6 +377,7 @@ class LightNovelShelf extends ComicSource {
   _invalidateAuthState() {
     this._authGeneration += 1;
     this._discardSharedHubSession();
+    this._clearComicContentStates();
     this._sessionToken = "";
     this._sessionTokenAt = 0;
     this._sessionTokenGeneration = 0;
@@ -1434,16 +1437,50 @@ class LightNovelShelf extends ComicSource {
     return { chapterId: chapterId, page: page };
   }
 
+  _clearComicContentStates() {
+    this._comicContentStates.clear();
+    this._comicContentUseSequence = 0;
+  }
+
+  _comicContentStateKey(chapterId) {
+    return `${this.apiBase}\n${this._authGeneration}\n${chapterId}`;
+  }
+
+  _touchComicContentState(key, state) {
+    state.lastUsed = ++this._comicContentUseSequence;
+    this._comicContentStates.set(key, state);
+
+    while (
+      this._comicContentStates.size >
+      LightNovelShelf.comicContentStateLimit
+    ) {
+      let oldestKey = null;
+      let oldestUse = Infinity;
+      for (const [candidateKey, candidate] of this._comicContentStates) {
+        if (candidate.lastUsed < oldestUse) {
+          oldestUse = candidate.lastUsed;
+          oldestKey = candidateKey;
+        }
+      }
+      if (oldestKey === null) break;
+      this._comicContentStates.delete(oldestKey);
+    }
+  }
+
   _getComicContentState(chapterId) {
-    let state = this._comicContentStates.get(chapterId);
+    const key = this._comicContentStateKey(chapterId);
+    let state = this._comicContentStates.get(key);
     if (!state) {
       state = {
+        apiBase: this.apiBase,
+        authGeneration: this._authGeneration,
         chapterId: chapterId,
         total: null,
         batches: new Map(),
+        lastUsed: 0,
       };
-      this._comicContentStates.set(chapterId, state);
     }
+    this._touchComicContentState(key, state);
     return state;
   }
 
@@ -1512,6 +1549,12 @@ class LightNovelShelf extends ComicSource {
         },
         { retryTransport: true },
       );
+      if (
+        state.apiBase !== this.apiBase ||
+        state.authGeneration !== this._authGeneration
+      ) {
+        throw new Error("轻书架章节图片请求已失效");
+      }
       const batch = this._comicContentBatchFromResponse(data, skip);
       if (state.total !== null && state.total !== batch.total) {
         throw new Error(
@@ -1519,6 +1562,10 @@ class LightNovelShelf extends ComicSource {
         );
       }
       state.total = batch.total;
+      const stateKey = this._comicContentStateKey(chapterId);
+      if (this._comicContentStates.get(stateKey) === state) {
+        this._touchComicContentState(stateKey, state);
+      }
       return batch;
     })();
     state.batches.set(skip, batchPromise);
