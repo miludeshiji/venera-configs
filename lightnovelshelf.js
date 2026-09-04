@@ -1,17 +1,16 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.18
+ * 版本：0.2.19
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
- * - HTTP Long Polling transport
+ * - WebSocket transport (skipNegotiation)
  * - 邮箱密码 / RefreshToken+x-id 登录并自动管理认证令牌
  * - RefreshToken -> session Token 自动刷新
  * - SignalR Bearer Token 认证
  * - 每日自动/手动签到
- * - Long Polling 防缓存参数
- * - 后台预连接 / 15 秒共享 Hub 会话 / 单连接批量发现页（12 项）/ 24 项分类分页
+ * - 后台预连接 / WebSocket 长期连接与自动重连 / 单连接批量发现页（12 项）/ 24 项分类分页
  * - 漫画阅读历史 / 搜索 / 详情 / 章节 / 正文图片 / 系列评论与回复
  *
  * 使用前：
@@ -25,7 +24,11 @@ class LightNovelShelf extends ComicSource {
   static comicContentPageSize = 6;
   static comicPageKeyPrefix = "lightnovelshelf-page://";
   static comicContentStateLimit = 3;
-  static hubIdleTimeoutMs = 15000;
+  static hubPingIntervalMs = 15000;
+  static hubInvocationTimeoutMs = 30000;
+  static hubConnectTimeoutMs = 30000;
+  static hubHandshakeTimeoutMs = 30000;
+  static hubReconnectDelays = [0, 5000, 10000, 20000, 30000];
   static hubNoReplayMessage =
     "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
   static tokenLoginFormatError =
@@ -33,9 +36,8 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.2.18";
-  minAppVersion = "1.0.0";
-
+  version = "0.2.19";
+  minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
 
@@ -43,13 +45,13 @@ class LightNovelShelf extends ComicSource {
   _sessionToken = "";
   _sessionTokenAt = 0;
   _sessionTokenGeneration = 0;
-
+  _sessionTokenApiBase = "";
   // 认证状态代际和共享刷新请求，防止旧账号响应覆盖当前会话。
   _authGeneration = 0;
   _refreshPromise = null;
   _refreshPromiseGeneration = 0;
   _refreshPromiseToken = "";
-
+  _refreshPromiseApiBase = "";
   // 每日签到状态：成功日期持久化，尝试日期只作用于当前 JS 实例。
   _signInInProgress = false;
   _autoSignInAttemptDate = "";
@@ -67,15 +69,27 @@ class LightNovelShelf extends ComicSource {
   _discoveryLoadGeneration = 0;
   _discoveryLoadInFlight = false;
 
-  // 单个 Long Polling session 由所有 Hub operation 串行租用。
-  _sharedHubSession = null;
-  _sharedHubOpenPromise = null;
-  _sharedHubGeneration = 0;
+  // 单一长期 WebSocket 状态机
+  _hubSocket = null;
+  _hubState = "disconnected";
+  _hubConnectPromise = null;
+  _hubConnectPromiseApiBase = "";
+  _hubConnectPromiseAuthGen = 0;
+  _hubReceiveLoopPromise = null;
+  _hubGeneration = 0;
+  _hubDesiredConnected = false;
+  _hubReconnectCount = 0;
+  _hubReconnectTimer = null;
+  _hubReconnectToken = 0;
+  _hubDisconnectedGeneration = 0;
+  _hubApiBase = "";
+  _hubAuthGeneration = 0;
+  _hubPingTimer = null;
+  _hubLastReceivedAt = 0;
+  _hubInvocationId = 0;
+  _hubPending = new Map();
+  _hubReceiveBuffer = "";
   _hubOperationQueue = Promise.resolve();
-  // 包含排队中和执行中的 operation，非零时不得空闲关闭。
-  _hubOperationCount = 0;
-  _hubIdleGeneration = 0;
-
   // 章节正文按章节和 6 页批次缓存共享 Promise。
   _comicContentStates = new Map();
   _comicChapterPageCounts = new Map();
@@ -103,12 +117,6 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
-  _textHeaders() {
-    return this._headers({
-      "Content-Type": "text/plain;charset=UTF-8",
-    });
-  }
-
   _jsonHeaders(extra) {
     return this._headers(
       Object.assign(
@@ -120,49 +128,22 @@ class LightNovelShelf extends ComicSource {
       ),
     );
   }
-
-  _authHeadersForToken(sessionToken, extra) {
-    const headers = this._headers(extra);
-
-    if (sessionToken) {
-      headers.Authorization = "Bearer " + sessionToken;
-    }
-
-    return headers;
+  _buildHubWebSocketUrl(sessionToken) {
+    let url = this.apiBase
+      .replace(/^https:/i, "wss:")
+      .replace(/^http:/i, "ws:");
+    url =
+      url.replace(/\/+$/, "") +
+      "/hub/api?access_token=" +
+      encodeURIComponent(sessionToken);
+    return url;
   }
 
-  _authHeaders(extra) {
-    return this._authHeadersForToken(this._sessionToken, extra);
-  }
-
-  _sessionAuthHeaders(session, extra) {
-    return this._authHeadersForToken(
-      session && session.sessionToken,
-      extra,
-    );
-  }
-
-  _authTextHeaders(extra) {
-    return this._authHeaders(
-      Object.assign(
-        {
-          "Content-Type": "text/plain;charset=UTF-8",
-        },
-        extra || {},
-      ),
-    );
-  }
-
-  _sessionAuthTextHeaders(session, extra) {
-    return this._sessionAuthHeaders(
-      session,
-      Object.assign(
-        {
-          "Content-Type": "text/plain;charset=UTF-8",
-        },
-        extra || {},
-      ),
-    );
+  _buildHubWebSocketHeaders(sessionToken) {
+    return this._headers({
+      "x-id": this._getVisitorId(),
+      Authorization: "Bearer " + sessionToken,
+    });
   }
 
   _assertStatus(res, expected, action) {
@@ -213,11 +194,43 @@ class LightNovelShelf extends ComicSource {
   }
 
   _isUnauthorizedError(error) {
+    if (error && typeof error === "object") {
+      const status =
+        error.status !== undefined ? error.status : error.statusCode;
+      const numericStatus =
+        typeof status === "number"
+          ? status
+          : typeof status === "string" && /^-?\d+$/.test(status.trim())
+          ? parseInt(status.trim(), 10)
+          : null;
+      if (numericStatus === 401 || numericStatus === -100) {
+        return true;
+      }
+      if (error.envelope && typeof error.envelope === "object") {
+        const envStatus =
+          error.envelope.Status !== undefined
+            ? error.envelope.Status
+            : error.envelope.status;
+        const envNum =
+          typeof envStatus === "number"
+            ? envStatus
+            : typeof envStatus === "string" && /^-?\d+$/.test(envStatus.trim())
+            ? parseInt(envStatus.trim(), 10)
+            : null;
+        if (envNum === 401 || envNum === -100) {
+          return true;
+        }
+      }
+      if (error.cause) {
+        return this._isUnauthorizedError(error.cause);
+      }
+    }
     const text = String(
       error && error.message ? error.message : error || "",
     ).toLowerCase();
     return (
       /\bhttp\s*(?:status\s*)?(?:401|403)\b/.test(text) ||
+      /\b(?:status\s*)?\[\s*(?:401|-100)\s*\]/.test(text) ||
       text.includes("user is unauthorized") ||
       text.includes("unauthorized") ||
       text.includes("未授权") ||
@@ -377,15 +390,18 @@ class LightNovelShelf extends ComicSource {
 
   _invalidateAuthState() {
     this._authGeneration += 1;
-    this._discardSharedHubSession();
+    this._hubDesiredConnected = false;
+    this._disconnectHub("Auth state invalidated");
     this._clearComicContentStates();
+    this._resetReadingHistoryState();
     this._sessionToken = "";
     this._sessionTokenAt = 0;
     this._sessionTokenGeneration = 0;
+    this._sessionTokenApiBase = "";
     this._refreshPromise = null;
     this._refreshPromiseGeneration = 0;
     this._refreshPromiseToken = "";
-    this._resetReadingHistoryState();
+    this._refreshPromiseApiBase = "";
     return this._authGeneration;
   }
 
@@ -416,6 +432,68 @@ class LightNovelShelf extends ComicSource {
     this._sessionToken = "";
     this._sessionTokenAt = 0;
     this._sessionTokenGeneration = 0;
+    this._sessionTokenApiBase = "";
+  }
+
+  _isTerminalRefreshStatus(error) {
+    if (error && typeof error === "object") {
+      const status =
+        error.status !== undefined ? error.status : error.statusCode;
+      const numericStatus =
+        typeof status === "number"
+          ? status
+          : typeof status === "string" && /^-?\d+$/.test(status.trim())
+          ? parseInt(status.trim(), 10)
+          : null;
+      if (
+        numericStatus === 401 ||
+        numericStatus === 404 ||
+        numericStatus === -100
+      ) {
+        return true;
+      }
+      if (error.envelope && typeof error.envelope === "object") {
+        const envStatus =
+          error.envelope.Status !== undefined
+            ? error.envelope.Status
+            : error.envelope.status;
+        const envNum =
+          typeof envStatus === "number"
+            ? envStatus
+            : typeof envStatus === "string" && /^-?\d+$/.test(envStatus.trim())
+            ? parseInt(envStatus.trim(), 10)
+            : null;
+        if (envNum === 401 || envNum === 404 || envNum === -100) {
+          return true;
+        }
+      }
+      if (error.cause) {
+        return this._isTerminalRefreshStatus(error.cause);
+      }
+    }
+    const text = String(
+      error && error.message ? error.message : error || "",
+    ).toLowerCase();
+    return (
+      /\bhttp\s*(?:status\s*)?(?:401|404)\b/.test(text) ||
+      /\b(?:status\s*)?\[\s*(?:401|404|-100)\s*\]/.test(text)
+    );
+  }
+
+  _isTerminalRefreshError(error) {
+    if (!error || typeof error !== "object") return false;
+    if (error.code === "LIGHTNOVELSHELF_TERMINAL_REFRESH") return true;
+    if (error.cause) return this._isTerminalRefreshError(error.cause);
+    return false;
+  }
+
+  _clearAuthCredentials(reason = "Credentials invalidated") {
+    this.deleteData("account");
+    this.deleteData("refreshToken");
+    this.deleteData("visitorId");
+    this.deleteData("lastSignInUtcDate");
+    this._autoSignInAttemptDate = "";
+    this._invalidateAuthState();
   }
 
   _hashPassword(password) {
@@ -508,6 +586,7 @@ class LightNovelShelf extends ComicSource {
     this._sessionToken = sessionToken;
     this._sessionTokenAt = Date.now();
     this._sessionTokenGeneration = committedGeneration;
+    this._sessionTokenApiBase = this.apiBase;
 
     return email;
   }
@@ -530,7 +609,15 @@ class LightNovelShelf extends ComicSource {
 
     if (!res || res.status !== 200) {
       const status = res && res.status !== undefined ? res.status : "未知";
-      throw new Error(`${action}失败: HTTP ${status}`);
+      const err = new Error(`${action}失败: HTTP ${status}`);
+      if (res && res.status !== undefined) {
+        err.status =
+          typeof res.status === "number"
+            ? res.status
+            : parseInt(res.status, 10);
+        err.statusCode = err.status;
+      }
+      throw err;
     }
 
     let envelope;
@@ -546,13 +633,29 @@ class LightNovelShelf extends ComicSource {
       Object.prototype.hasOwnProperty.call(envelope, "Success")
     ) {
       if (!envelope.Success) {
+        const rawStatus =
+          envelope.Status !== undefined
+            ? envelope.Status
+            : envelope.status;
         const status =
-          envelope.Status !== undefined ? ` [${envelope.Status}]` : "";
+          rawStatus !== undefined ? ` [${rawStatus}]` : "";
         const message =
           typeof envelope.Msg === "string" && envelope.Msg.trim()
             ? `: ${envelope.Msg.trim()}`
             : "";
-        throw new Error(`${action}失败${status}${message}`);
+        const err = new Error(`${action}失败${status}${message}`);
+        if (rawStatus !== undefined) {
+          err.status =
+            typeof rawStatus === "number"
+              ? rawStatus
+              : typeof rawStatus === "string" &&
+                  /^-?\d+$/.test(rawStatus.trim())
+                ? parseInt(rawStatus.trim(), 10)
+                : rawStatus;
+          err.statusCode = err.status;
+        }
+        err.envelope = envelope;
+        throw err;
       }
       envelope = envelope.Response;
     }
@@ -618,6 +721,7 @@ class LightNovelShelf extends ComicSource {
     this._sessionToken = sessionToken;
     this._sessionTokenAt = Date.now();
     this._sessionTokenGeneration = committedGeneration;
+    this._sessionTokenApiBase = this.apiBase;
     this.saveData("account", "token");
     return "ok";
   }
@@ -662,13 +766,15 @@ class LightNovelShelf extends ComicSource {
   async _refreshSessionToken(force) {
     const authGeneration = this._authGeneration;
     const refreshToken = this._getRefreshToken();
+    const currentApiBase = this.apiBase;
     const ownedSessionToken = this._sessionToken;
 
-    // 同一认证代际和 RefreshToken 只允许一个刷新请求在途。
+    // 同一认证代际、RefreshToken 与 API 线路只允许一个刷新请求在途。
     if (
       this._refreshPromise &&
       this._refreshPromiseGeneration === authGeneration &&
-      this._refreshPromiseToken === refreshToken
+      this._refreshPromiseToken === refreshToken &&
+      this._refreshPromiseApiBase === currentApiBase
     ) {
       return await this._refreshPromise;
     }
@@ -677,6 +783,7 @@ class LightNovelShelf extends ComicSource {
       !force &&
       this._sessionToken &&
       this._sessionTokenGeneration === authGeneration &&
+      this._sessionTokenApiBase === currentApiBase &&
       this._authStateMatches(authGeneration, refreshToken) &&
       Date.now() - this._sessionTokenAt < 15000
     ) {
@@ -687,10 +794,11 @@ class LightNovelShelf extends ComicSource {
     let refreshPromise;
 
     refreshPromise = (async () => {
-      const assertCurrentAuth = () => {
-        if (!this._authStateMatches(authGeneration, refreshToken)) {
-          throw new Error("轻书架登录状态已变更，刷新结果已失效");
-        }
+      const isOwned = () => {
+        return (
+          this._authStateMatches(authGeneration, refreshToken) &&
+          this.apiBase === currentApiBase
+        );
       };
 
       try {
@@ -699,67 +807,71 @@ class LightNovelShelf extends ComicSource {
           visitorId,
           "刷新轻书架登录状态",
         );
-        assertCurrentAuth();
+        if (!isOwned()) {
+          throw new Error("轻书架登录状态或线路已变更，刷新结果已失效");
+        }
         this._sessionToken = token;
         this._sessionTokenAt = Date.now();
         this._sessionTokenGeneration = authGeneration;
+        this._sessionTokenApiBase = currentApiBase;
         return token;
       } catch (error) {
-        assertCurrentAuth();
-        this._clearSessionTokenIfOwned(
-          authGeneration,
-          refreshToken,
-          ownedSessionToken,
-        );
+        if (!isOwned()) {
+          // 切换线路或登出后，旧线路晚到失败绝不得清除新线路状态或凭据
+          throw error;
+        }
+        const isTerminal = this._isTerminalRefreshStatus(error);
+        if (isTerminal) {
+          this._clearAuthCredentials("Terminal refresh credential failure");
+        } else {
+          this._clearSessionTokenIfOwned(
+            authGeneration,
+            refreshToken,
+            ownedSessionToken,
+          );
+        }
         const detail = String(
           error && error.message ? error.message : error || "未知错误",
         ).replace(/[。.]+$/, "");
-        throw new Error(`${detail}。请在 Venera 中重新登录。`);
+        const wrappedErr = new Error(`${detail}。请在 Venera 中重新登录。`);
+        if (isTerminal) {
+          wrappedErr.code = "LIGHTNOVELSHELF_TERMINAL_REFRESH";
+        }
+        if (error && typeof error === "object") {
+          if (error.status !== undefined) {
+            wrappedErr.status = error.status;
+            wrappedErr.statusCode = error.status;
+          }
+          if (error.cause !== undefined) {
+            wrappedErr.cause = error.cause;
+          } else {
+            wrappedErr.cause = error;
+          }
+        }
+        throw wrappedErr;
       }
     })();
 
     this._refreshPromise = refreshPromise;
     this._refreshPromiseGeneration = authGeneration;
     this._refreshPromiseToken = refreshToken;
+    this._refreshPromiseApiBase = currentApiBase;
 
     try {
       return await refreshPromise;
     } finally {
-      if (this._refreshPromise === refreshPromise) {
+      if (
+        this._refreshPromise === refreshPromise &&
+        this._refreshPromiseGeneration === authGeneration &&
+        this._refreshPromiseToken === refreshToken &&
+        this._refreshPromiseApiBase === currentApiBase
+      ) {
         this._refreshPromise = null;
         this._refreshPromiseGeneration = 0;
         this._refreshPromiseToken = "";
+        this._refreshPromiseApiBase = "";
       }
     }
-  }
-
-  /**
-   * 给 Long Polling GET 添加唯一查询参数。
-   *
-   * VeneraNext 的 Network.get 对完全相同 URL 可能命中缓存；
-   * 如果不改变 URL，会把旧的 handshake/公告响应重复返回，
-   * 导致看不到 Hub Completion。
-   */
-  _pollUrl(session) {
-    session.pollSeq = (session.pollSeq || 0) + 1;
-
-    return (
-      session.url +
-      "&_venera_poll=" +
-      Date.now() +
-      "_" +
-      session.pollSeq
-    );
-  }
-
-  _pollHeaders(session) {
-    const headers = session
-      ? this._sessionAuthHeaders(session)
-      : this._authHeaders();
-    return Object.assign(headers, {
-      "Cache-Control": "no-cache, no-store",
-      Pragma: "no-cache",
-    });
   }
 
   _hubTransportError(message, cause) {
@@ -784,321 +896,626 @@ class LightNovelShelf extends ComicSource {
     return error;
   }
 
-  async _hubTransportRequest(action, request, expected = 200) {
+  _isHubNoReplayError(error) {
+    if (!error || typeof error !== "object") return false;
+    if (error.code === "LIGHTNOVELSHELF_HUB_NO_REPLAY") return true;
+    if (error.cause) return this._isHubNoReplayError(error.cause);
+    return false;
+  }
+
+  _hubTimeoutError(message, cause) {
+    const error = new Error(String(message));
+    error.code = "LIGHTNOVELSHELF_HUB_TIMEOUT";
+    if (cause !== undefined) error.cause = cause;
+    return error;
+  }
+
+  _isHubTimeoutError(error) {
+    return !!(
+      error &&
+      typeof error === "object" &&
+      error.code === "LIGHTNOVELSHELF_HUB_TIMEOUT"
+    );
+  }
+
+  async _closeSocketSafely(socket, code = 1000, reason = "") {
+    if (!socket || socket.closed) return;
     try {
-      const response = await request();
-      const accepted = Array.isArray(expected)
-        ? expected.indexOf(response && response.status) >= 0
-        : response && response.status === expected;
-
-      if (!accepted) {
-        const status =
-          response && response.status !== undefined
-            ? response.status
-            : "未知";
-        throw this._hubTransportError(`${action}失败: HTTP ${status}`);
+      const safeReason = String(reason || "").slice(0, 30);
+      const closePromise = socket.close(code, safeReason);
+      if (closePromise && typeof closePromise.catch === "function") {
+        closePromise.catch(() => {});
       }
-
-      return response;
-    } catch (error) {
-      if (this._isHubTransportError(error)) throw error;
-      const detail = String(
-        error && error.message ? error.message : error || "未知错误",
-      );
-      throw this._hubTransportError(`${action}失败: ${detail}`, error);
+      await closePromise;
+    } catch (_) {
+      // 忽略关闭异常
     }
   }
 
   /**
-   * 建立一个已认证的 SignalR Long Polling 会话。
-   *
-   * 流程：
-   * RefreshToken -> session Token
-   * negotiate
-   * -> 首次 GET 初始化 transport
-   * -> JSON handshake
-   * -> GET handshake response
+   * 保证单个长期 WebSocket 连接已建立并处于 connected 状态。
+   * 若当前处于 connecting 状态，并发请求复用同一个 _hubConnectPromise。
    */
-  async _openHub(forceRefresh) {
-    const authGeneration = this._authGeneration;
-    const refreshToken = this._getRefreshToken();
-    const apiBase = this.apiBase;
-    await this._refreshSessionToken(!!forceRefresh);
+  async _ensureHubConnected(forceRefresh = false) {
+    const currentApiBase = this.apiBase;
+    const currentAuthGen = this._authGeneration;
+    const isReusable =
+      !forceRefresh &&
+      this._hubState === "connected" &&
+      this._hubSocket &&
+      !this._hubSocket.closed &&
+      this._hubApiBase === currentApiBase &&
+      this._hubAuthGeneration === currentAuthGen;
 
-    if (
-      !this._authStateMatches(authGeneration, refreshToken) ||
-      this._sessionTokenGeneration !== authGeneration ||
-      !this._sessionToken
-    ) {
-      throw new Error("轻书架登录状态已变更，无法建立会话");
+    if (isReusable) {
+      return this._hubSocket;
     }
 
-    const hubUrl = apiBase + "/hub/api";
-    const negotiateUrl = hubUrl + "/negotiate?negotiateVersion=1";
-    const sessionToken = this._sessionToken;
-    const session = {
-      url: "",
-      seq: 0,
-      pollSeq: 0,
-      apiBase: apiBase,
-      authGeneration: authGeneration,
-      refreshToken: refreshToken,
-      // 会话创建后始终使用此 Token，不跟随全局 Token 变化。
-      sessionToken: sessionToken,
-      createdAt: 0,
-    };
-    const clearRejectedToken = (error) => {
-      if (this._isUnauthorizedError(error)) {
-        this._clearSessionTokenIfOwned(
-          authGeneration,
-          refreshToken,
-          sessionToken,
-        );
-      }
-      return error;
-    };
-    const openingRequest = async (action, request, expected = 200) => {
-      try {
-        return await this._hubTransportRequest(action, request, expected);
-      } catch (error) {
-        throw clearRejectedToken(error);
-      }
-    };
+    if (
+      forceRefresh ||
+      (this._hubSocket &&
+        (this._hubApiBase !== currentApiBase ||
+          this._hubAuthGeneration !== currentAuthGen))
+    ) {
+      this._disconnectHub("Recreating connection");
+    }
 
-    const negotiateRes = await openingRequest(
-      "SignalR negotiate",
-      async () =>
-        await Network.post(
-          negotiateUrl,
-          this._sessionAuthTextHeaders(session),
-          "",
-        ),
-    );
+    if (
+      this._hubConnectPromise &&
+      !forceRefresh &&
+      this._hubConnectPromiseApiBase === currentApiBase &&
+      this._hubConnectPromiseAuthGen === currentAuthGen
+    ) {
+      return await this._hubConnectPromise;
+    }
 
-    let negotiate;
+    if (this._hubConnectPromise) {
+      this._disconnectHub("Route or auth changed during in-flight connect");
+    }
+
+    const connectPromise = this._openHubWebSocket(forceRefresh);
+    this._hubConnectPromise = connectPromise;
+    this._hubConnectPromiseApiBase = currentApiBase;
+    this._hubConnectPromiseAuthGen = currentAuthGen;
+
     try {
-      negotiate = JSON.parse(negotiateRes.body);
+      return await connectPromise;
+    } finally {
+      if (this._hubConnectPromise === connectPromise) {
+        this._hubConnectPromise = null;
+        this._hubConnectPromiseApiBase = "";
+        this._hubConnectPromiseAuthGen = 0;
+      }
+    }
+  }
+
+  /**
+   * 建立 SignalR WebSocket 连接：
+   * 1. 获取有效 Session Token；
+   * 2. 直连 /hub/api?access_token= 并附带认证与设备头；
+   * 3. 发送 SignalR JSON Handshake，并在 30 秒内等待响应；
+   * 4. 启动唯一的后台 Receive Loop 与 Ping 保活。
+   */
+  async _openHubWebSocket(forceRefresh = false) {
+    const authGeneration = this._authGeneration;
+    const refreshToken = this._getRefreshToken();
+    const wsApiBase = this.apiBase;
+
+    this._hubGeneration += 1;
+    const generation = this._hubGeneration;
+    this._hubDesiredConnected = true;
+    this._hubState = "connecting";
+    this._hubReceiveBuffer = "";
+    this._clearHubReconnectTimer();
+
+    let sessionToken = "";
+    try {
+      await this._refreshSessionToken(!!forceRefresh);
+
+      if (
+        !this._authStateMatches(authGeneration, refreshToken) ||
+        this._sessionTokenGeneration !== authGeneration ||
+        !this._sessionToken
+      ) {
+        throw new Error("轻书架登录状态已变更，无法建立连接");
+      }
+      sessionToken = this._sessionToken;
+    } catch (refreshErr) {
+      const isCurrentRouteAndAuth =
+        this.apiBase === wsApiBase &&
+        generation === this._hubGeneration &&
+        this._authGeneration === authGeneration;
+      if (this._isTerminalRefreshError(refreshErr)) {
+        if (isCurrentRouteAndAuth) {
+          this._clearAuthCredentials("Terminal refresh credential failure");
+        }
+      } else {
+        if (generation === this._hubGeneration) {
+          if (this._isUnauthorizedError(refreshErr)) {
+            this._clearSessionTokenIfOwned(
+              authGeneration,
+              refreshToken,
+              sessionToken,
+            );
+          }
+          this._handleHubDisconnected(null, generation, refreshErr);
+        }
+      }
+      throw refreshErr;
+    }
+
+    if (
+      generation !== this._hubGeneration ||
+      !this._hubDesiredConnected ||
+      this.apiBase !== wsApiBase ||
+      this._authGeneration !== authGeneration
+    ) {
+      throw new Error("轻书架连接已取消");
+    }
+
+    const wsUrl = this._buildHubWebSocketUrl(sessionToken);
+    const headers = this._buildHubWebSocketHeaders(sessionToken);
+    const connectTimeoutMs = this.constructor.hubConnectTimeoutMs || 30000;
+
+    let socket = null;
+    try {
+      socket = await Network.WebSocket.connect(wsUrl, headers, {
+        connectTimeoutMs: connectTimeoutMs,
+      });
     } catch (error) {
+      if (generation === this._hubGeneration) {
+        if (this._isUnauthorizedError(error)) {
+          this._clearSessionTokenIfOwned(
+            authGeneration,
+            refreshToken,
+            sessionToken,
+          );
+        }
+        this._handleHubDisconnected(null, generation, error);
+      }
       throw this._hubTransportError(
-        "SignalR negotiate 返回了无效 JSON",
+        `轻书架 WebSocket 建连失败: ${error && error.message ? error.message : error}`,
         error,
       );
     }
 
-    if (negotiate.error) {
-      throw clearRejectedToken(
+    if (
+      generation !== this._hubGeneration ||
+      !this._hubDesiredConnected ||
+      this.apiBase !== wsApiBase ||
+      this._authGeneration !== authGeneration
+    ) {
+      this._closeSocketSafely(socket, 1000, "Connect superseded");
+      throw new Error("轻书架连接已取消");
+    }
+
+    this._hubSocket = socket;
+
+    let handshakeDone = false;
+    let handshakeResolve = null;
+    let handshakeReject = null;
+    const handshakePromise = new Promise((resolve, reject) => {
+      handshakeResolve = resolve;
+      handshakeReject = reject;
+    });
+    handshakePromise.catch(() => {});
+
+    const handshakeTimeoutMs = this.constructor.hubHandshakeTimeoutMs || 30000;
+    setTimeout(() => {
+      if (!handshakeDone) {
+        handshakeDone = true;
+        const timeoutErr = this._hubTransportError(
+          `SignalR 握手超时 (${Math.round(handshakeTimeoutMs / 1000)}秒)`,
+        );
+        handshakeReject(timeoutErr);
+      }
+    }, handshakeTimeoutMs);
+
+    const handshakeHooks = {
+      isHandshakeDone: false,
+      onHandshakeSuccess: () => {
+        if (handshakeDone) return;
+        handshakeDone = true;
+        handshakeHooks.isHandshakeDone = true;
+        handshakeResolve();
+      },
+      onHandshakeError: (err) => {
+        if (handshakeDone) return;
+        handshakeDone = true;
+        handshakeHooks.isHandshakeDone = true;
+        if (this._isUnauthorizedError(err)) {
+          this._clearSessionTokenIfOwned(
+            authGeneration,
+            refreshToken,
+            sessionToken,
+          );
+        }
+        handshakeReject(err);
+      },
+    };
+
+    this._hubReceiveLoopPromise = this._startHubReceiveLoop(
+      socket,
+      generation,
+      handshakeHooks,
+    );
+
+    try {
+      await socket.send(
+        JSON.stringify({ protocol: "json", version: 1 }) + "\x1e",
+      );
+    } catch (sendErr) {
+      handshakeHooks.onHandshakeError(
         this._hubTransportError(
-          `SignalR negotiate 失败: ${negotiate.error}`,
+          `发送 SignalR 握手消息失败: ${sendErr && sendErr.message ? sendErr.message : sendErr}`,
+          sendErr,
         ),
       );
     }
 
-    if (negotiate.url) {
-      throw this._hubTransportError(
-        "SignalR 返回了重定向地址，当前源暂未实现重定向协商: " +
-          negotiate.url,
-      );
-    }
-
-    const connectionToken = negotiate.connectionToken || negotiate.connectionId;
-
-    if (!connectionToken) {
-      throw this._hubTransportError(
-        "SignalR negotiate 未返回 connectionToken/connectionId",
-      );
-    }
-
-    const transports = negotiate.availableTransports || [];
-    const longPolling = transports.find((x) => x.transport === "LongPolling");
-
-    if (!longPolling) {
-      throw this._hubTransportError(
-        "服务端没有提供 SignalR LongPolling transport",
-      );
+    try {
+      await handshakePromise;
+    } catch (handshakeErr) {
+      this._closeSocketSafely(socket, 1000, "Handshake failed");
+      if (generation === this._hubGeneration) {
+        this._handleHubDisconnected(socket, generation, handshakeErr);
+      }
+      throw handshakeErr;
     }
 
     if (
-      Array.isArray(longPolling.transferFormats) &&
-      longPolling.transferFormats.indexOf("Text") < 0
+      generation !== this._hubGeneration ||
+      !this._hubDesiredConnected ||
+      this.apiBase !== wsApiBase ||
+      this._authGeneration !== authGeneration
     ) {
-      throw this._hubTransportError(
-        "服务端 LongPolling 不支持 Text transfer format",
-      );
+      this._closeSocketSafely(socket, 1000, "Connected superseded");
+      throw new Error("轻书架连接已取消");
     }
 
-    session.url = hubUrl + "?id=" + encodeURIComponent(connectionToken);
+    if (
+      this._hubSocket !== socket ||
+      socket.closed ||
+      this._hubDisconnectedGeneration === generation
+    ) {
+      this._closeSocketSafely(socket, 1000, "Socket closed during handshake");
+      const err = this._hubTransportError("轻书架 WebSocket 在握手完成时已断开");
+      if (
+        this._hubDisconnectedGeneration !== generation &&
+        generation === this._hubGeneration
+      ) {
+        this._handleHubDisconnected(socket, generation, err);
+      }
+      throw err;
+    }
+    this._hubSocket = socket;
+    this._hubApiBase = wsApiBase;
+    this._hubAuthGeneration = authGeneration;
+    this._hubState = "connected";
+    this._hubReconnectCount = 0;
+    this._hubLastReceivedAt = Date.now();
+    this._startHubPing(socket, generation);
+    return socket;
+  }
 
-    let established = false;
-
+  /**
+   * 唯一的后台 Receive Loop，负责持续从 socket.receive() 拉取消息。
+   * 严禁在调用方并发调用 socket.receive()。
+   */
+  async _startHubReceiveLoop(socket, generation, handshakeHooks) {
+    let loopError = null;
     try {
-      // SignalR Long Polling 的第一次 GET 用于初始化 transport。
-      await openingRequest(
-        "SignalR transport 初始化",
-        async () =>
-          await Network.get(
-            this._pollUrl(session),
-            this._pollHeaders(session),
-          ),
-      );
+      while (
+        generation === this._hubGeneration &&
+        this._hubSocket === socket &&
+        !socket.closed
+      ) {
+        let event = null;
+        try {
+          event = await socket.receive();
+        } catch (recvErr) {
+          loopError = recvErr;
+          break;
+        }
 
-      // Hub handshake 固定为 JSON，并以 0x1e Record Separator 结束。
-      const handshake = JSON.stringify({ protocol: "json", version: 1 }) + "\x1e";
+        if (generation !== this._hubGeneration || this._hubSocket !== socket) {
+          break;
+        }
 
-      await openingRequest(
-        "SignalR handshake 发送",
-        async () =>
-          await Network.post(
-            session.url,
-            this._sessionAuthTextHeaders(session),
-            handshake,
-          ),
-      );
+        if (!event || event.type === "close") {
+          const code = event && event.code != null ? event.code : "未知";
+          const reason = event && event.reason ? event.reason : "none";
+          loopError = this._hubTransportError(
+            `轻书架 WebSocket 通道已关闭 (code: ${code}, reason: ${reason})`,
+          );
+          break;
+        }
 
-      // 服务端通常在下一次 poll 返回：{}\x1e，并可能同时推送 OnMessage 公告。
-      let handshakeDone = false;
-
-      for (let i = 0; i < 6 && !handshakeDone; i++) {
-        const poll = await openingRequest(
-          "SignalR handshake 接收",
-          async () =>
-            await Network.get(
-              this._pollUrl(session),
-              this._pollHeaders(session),
-            ),
-        );
-
-        for (const frame of this._frames(poll.body)) {
-          if (frame.error) {
-            throw clearRejectedToken(
-              this._hubTransportError(
-                `SignalR handshake 失败: ${frame.error}`,
-              ),
-            );
-          }
-
-          if (typeof frame === "object" && Object.keys(frame).length === 0) {
-            handshakeDone = true;
-            break;
-          }
+        if (event.type === "message") {
+          this._hubLastReceivedAt = Date.now();
+          this._handleHubMessage(
+            event.data,
+            socket,
+            generation,
+            handshakeHooks,
+          );
         }
       }
-
-      if (!handshakeDone) {
-        throw this._hubTransportError("SignalR handshake 未收到有效响应");
-      }
-
-      session.createdAt = Date.now();
-      established = true;
-      return session;
+    } catch (err) {
+      loopError = err;
     } finally {
-      if (!established) {
-        await this._closeHub(session);
+      if (handshakeHooks && !handshakeHooks.isHandshakeDone) {
+        handshakeHooks.onHandshakeError(
+          loopError || this._hubTransportError("WebSocket 在完成握手前已断开"),
+        );
       }
+      this._handleHubDisconnected(socket, generation, loopError);
     }
   }
 
-  async _closeHub(session) {
-    if (!session || !session.url) return;
-
-    try {
-      await Network.delete(session.url, this._sessionAuthHeaders(session));
-    } catch (_) {
-      // 关闭失败不影响已经取得的漫画数据。
-    }
-  }
-
-  _sharedHubSessionMatches(session) {
-    if (!session || !session.url) return false;
-
-    const currentRefreshToken = this.loadData("refreshToken");
-    return (
-      session.apiBase === this.apiBase &&
-      session.authGeneration === this._authGeneration &&
-      currentRefreshToken !== undefined &&
-      currentRefreshToken !== null &&
-      String(currentRefreshToken).trim() === session.refreshToken &&
-      session.sessionToken === this._sessionToken &&
-      this._sessionTokenGeneration === this._authGeneration
-    );
-  }
-
-  _closeHubInBackground(session) {
-    if (!session) return;
-    const closing = this._closeHub(session);
-    if (closing && typeof closing.catch === "function") {
-      closing.catch(() => {});
-    }
-  }
-
-  _discardSharedHubSession(expectedSession = null) {
-    if (
-      expectedSession &&
-      this._sharedHubSession !== expectedSession
-    ) {
-      this._closeHubInBackground(expectedSession);
+  /**
+   * 处理接收到的 WebSocket 文本帧数据。支持单条消息中包含多个 0x1E Record Separator 帧，
+   * 并正确处理握手帧后紧随的业务帧。
+   */
+  _handleHubMessage(data, socket, generation, handshakeHooks) {
+    if (generation !== this._hubGeneration || this._hubSocket !== socket) {
       return;
     }
 
-    const session = this._sharedHubSession;
-    this._sharedHubSession = null;
-    this._sharedHubOpenPromise = null;
-    this._sharedHubGeneration += 1;
-    this._hubIdleGeneration += 1;
-    this._closeHubInBackground(session);
+    let text = data;
+    if (typeof text !== "string") {
+      try {
+        text = Convert.decodeUtf8(text);
+      } catch (_) {
+        return;
+      }
+    }
+
+    this._hubReceiveBuffer = (this._hubReceiveBuffer || "") + (text || "");
+    const parts = this._hubReceiveBuffer.split("\x1e");
+    this._hubReceiveBuffer = parts.pop() || "";
+
+    for (const part of parts) {
+      const trimmed = part.trim();
+      if (!trimmed) continue;
+
+      let frame = null;
+      try {
+        frame = JSON.parse(trimmed);
+      } catch (_) {
+        continue;
+      }
+
+      if (!frame || typeof frame !== "object") continue;
+
+      // 1. 若握手尚未标记完成，优先检查是否为握手响应帧
+      if (handshakeHooks && !handshakeHooks.isHandshakeDone) {
+        if (frame.error) {
+          handshakeHooks.onHandshakeError(
+            this._hubTransportError(`SignalR 握手失败: ${frame.error}`),
+          );
+          return;
+        }
+
+        if (
+          (frame.type === undefined && Object.keys(frame).length === 0) ||
+          frame.type === undefined
+        ) {
+          handshakeHooks.onHandshakeSuccess();
+          continue;
+        }
+      }
+
+      // 2. 握手已完成，分发各 SignalR 帧
+      const frameType = frame.type;
+
+      if (frameType === 1) {
+        // 服务端主动 Invocation（如 OnMessage 公告），忽略未知 target，绝不断开连接
+        continue;
+      }
+
+      if (frameType === 3) {
+        // Invocation Completion 帧
+        const invocationId = String(frame.invocationId);
+        const pending = this._hubPending.get(invocationId);
+        if (pending) {
+          this._hubPending.delete(invocationId);
+          if (frame.error) {
+            pending.reject(
+              new Error(`SignalR ${pending.target} 调用失败: ${frame.error}`),
+            );
+          } else {
+            try {
+              const unwrapped = this._unwrapHubResult(
+                pending.target,
+                frame.result,
+              );
+              pending.resolve(unwrapped);
+            } catch (unwrapErr) {
+              pending.reject(unwrapErr);
+            }
+          }
+        }
+        continue;
+      }
+
+      if (frameType === 6) {
+        // Ping 帧，刷新连接活跃时间
+        this._hubLastReceivedAt = Date.now();
+        continue;
+      }
+
+      if (frameType === 7) {
+        // 服务端主动 Close 帧
+        const reason = frame.error
+          ? `服务端关闭连接: ${frame.error}`
+          : "服务端关闭连接";
+        this._closeSocketSafely(socket, 1000, reason);
+        this._handleHubDisconnected(
+          socket,
+          generation,
+          this._hubTransportError(reason),
+        );
+        return;
+      }
+    }
   }
 
-  _scheduleSharedHubClose(session) {
-    if (!session || this._sharedHubSession !== session) return;
-
-    const idleGeneration = ++this._hubIdleGeneration;
-    setTimeout(() => {
+  _startHubPing(socket, generation) {
+    this._stopHubPing();
+    const intervalMs = this.constructor.hubPingIntervalMs || 15000;
+    this._hubPingTimer = setInterval(async () => {
       if (
-        idleGeneration !== this._hubIdleGeneration ||
-        this._sharedHubSession !== session ||
-        this._hubOperationCount !== 0
+        generation !== this._hubGeneration ||
+        this._hubSocket !== socket ||
+        this._hubState !== "connected" ||
+        socket.closed
+      ) {
+        this._stopHubPing();
+        return;
+      }
+      try {
+        await socket.send(JSON.stringify({ type: 6 }) + "\x1e");
+      } catch (pingErr) {
+        this._stopHubPing();
+        if (generation === this._hubGeneration && this._hubSocket === socket) {
+          this._closeSocketSafely(socket, 1000, "Ping failed");
+          this._handleHubDisconnected(
+            socket,
+            generation,
+            this._hubTransportError(
+              `发送 SignalR 保活 Ping 失败: ${pingErr && pingErr.message ? pingErr.message : pingErr}`,
+              pingErr,
+            ),
+          );
+        }
+      }
+    }, intervalMs);
+  }
+
+  _stopHubPing() {
+    if (this._hubPingTimer) {
+      try {
+        if (typeof this._hubPingTimer.cancel === "function") {
+          this._hubPingTimer.cancel();
+        }
+      } catch (_) {}
+      this._hubPingTimer = null;
+    }
+  }
+
+  _clearHubReconnectTimer() {
+    this._hubReconnectToken += 1;
+    this._hubReconnectTimer = null;
+  }
+
+  _getHubReconnectDelay() {
+    const delays = this.constructor.hubReconnectDelays || [
+      0, 5000, 10000, 20000, 30000,
+    ];
+    const index = Math.min(this._hubReconnectCount, delays.length - 1);
+    return delays[index];
+  }
+
+  /**
+   * 连接断开后统一处理：
+   * 1. 确认代际并清理当前 Socket；
+   * 2. 停止 Ping；
+   * 3. 拒绝待处理请求（根据 retryTransport / sent 区分状态修改的 NO_REPLAY 与幂等读取重试）；
+   * 4. 若 desiredConnected 为 true，按退避策略调度自动重连。
+   */
+  _handleHubDisconnected(socket, generation, error) {
+    if (generation !== this._hubGeneration) return;
+    if (socket && this._hubSocket && this._hubSocket !== socket) return;
+    if (this._hubDisconnectedGeneration === generation) return;
+    this._hubDisconnectedGeneration = generation;
+
+    this._stopHubPing();
+    this._hubReceiveBuffer = "";
+    const activeSocket = this._hubSocket || socket;
+    this._hubSocket = null;
+    if (activeSocket) {
+      this._closeSocketSafely(activeSocket, 1000, "Disconnected");
+    }
+
+    if (this._hubState !== "closing") {
+      this._hubState = "disconnected";
+    }
+
+    if (this._hubPending.size > 0) {
+      for (const [, item] of this._hubPending) {
+        if (item.sent) {
+          if (item.retryTransport) {
+            item.reject(
+              this._hubTransportError("轻书架网络通道已断开", error),
+            );
+          } else {
+            item.reject(this._hubNoReplayError(error));
+          }
+        } else {
+          item.reject(
+            this._hubTransportError("轻书架网络通道在发送前已断开", error),
+          );
+        }
+      }
+      this._hubPending.clear();
+    }
+
+    if (!this._hubDesiredConnected) {
+      return;
+    }
+
+    this._hubState = "reconnecting";
+    const delay = this._getHubReconnectDelay();
+    this._hubReconnectCount += 1;
+
+    this._clearHubReconnectTimer();
+    const scheduledToken = ++this._hubReconnectToken;
+    this._hubReconnectTimer = scheduledToken;
+    setTimeout(async () => {
+      if (
+        scheduledToken !== this._hubReconnectToken ||
+        !this._hubDesiredConnected ||
+        generation !== this._hubGeneration
       ) {
         return;
       }
-      this._discardSharedHubSession(session);
-    }, LightNovelShelf.hubIdleTimeoutMs);
+      this._hubReconnectTimer = null;
+      try {
+        await this._ensureHubConnected(false);
+      } catch (_) {
+        // 重连失败后已由 _openHubWebSocket 内部调度下一次退避
+      }
+    }, delay);
   }
 
-  async _ensureSharedHubSession(forceRefresh) {
-    if (forceRefresh) {
-      this._discardSharedHubSession();
-    } else if (this._sharedHubSessionMatches(this._sharedHubSession)) {
-      return this._sharedHubSession;
-    } else if (this._sharedHubSession) {
-      this._discardSharedHubSession(this._sharedHubSession);
+  /**
+   * 主动关闭 Hub 连接并复位状态机（登出或认证失效时调用）。
+   */
+  _disconnectHub(reason = "Disconnected") {
+    this._hubDesiredConnected = false;
+    this._hubGeneration += 1;
+    this._clearHubReconnectTimer();
+    this._stopHubPing();
+    this._hubState = "disconnected";
+    this._hubReceiveBuffer = "";
+    this._hubReconnectCount = 0;
+
+    if (this._hubPending.size > 0) {
+      const err = this._hubTransportError(`轻书架连接已关闭 (${reason})`);
+      for (const [, item] of this._hubPending) {
+        item.reject(err);
+      }
+      this._hubPending.clear();
     }
 
-    if (!forceRefresh && this._sharedHubOpenPromise) {
-      return await this._sharedHubOpenPromise;
-    }
-
-    const sharedGeneration = this._sharedHubGeneration;
-    let openPromise;
-    openPromise = (async () => {
-      const session = await this._openHub(!!forceRefresh);
-      if (
-        sharedGeneration !== this._sharedHubGeneration ||
-        !this._sharedHubSessionMatches(session)
-      ) {
-        this._closeHubInBackground(session);
-        throw new Error("轻书架预连接已失效");
-      }
-
-      this._sharedHubSession = session;
-      return session;
-    })();
-    this._sharedHubOpenPromise = openPromise;
-
-    try {
-      return await openPromise;
-    } finally {
-      if (this._sharedHubOpenPromise === openPromise) {
-        this._sharedHubOpenPromise = null;
-      }
+    const socket = this._hubSocket;
+    this._hubSocket = null;
+    this._hubConnectPromise = null;
+    this._hubConnectPromiseApiBase = "";
+    this._hubConnectPromiseAuthGen = 0;
+    if (socket) {
+      this._closeSocketSafely(socket, 1000, reason);
     }
   }
 
@@ -1112,9 +1529,6 @@ class LightNovelShelf extends ComicSource {
   }
 
   _unwrapHubResult(target, envelope) {
-    // 轻书架目前的 Hub JSON 使用 camelCase：{ response: ... }。
-    // 旧实现/其他线路可能仍返回 PascalCase：
-    // { Success, Response, Status, Msg }。
     if (envelope && typeof envelope === "object") {
       const hasSuccess =
         Object.prototype.hasOwnProperty.call(envelope, "Success") ||
@@ -1127,19 +1541,33 @@ class LightNovelShelf extends ComicSource {
             : envelope.success;
 
         if (!success) {
-          const status =
+          const rawStatus =
             envelope.Status !== undefined
               ? envelope.Status
               : envelope.status;
+          const status =
+            rawStatus !== undefined ? ` [${rawStatus}]` : "";
           const msg =
             envelope.Msg !== undefined ? envelope.Msg : envelope.msg;
 
-          throw `${target} 失败${
-            status !== undefined ? ` [${status}]` : ""
-          }: ${msg || "Unknown error"}`;
+          const err = new Error(
+            `${target} 失败${status}: ${msg || "Unknown error"}`,
+          );
+          if (rawStatus !== undefined) {
+            err.status =
+              typeof rawStatus === "number"
+                ? rawStatus
+                : typeof rawStatus === "string" &&
+                    /^-?\d+$/.test(rawStatus.trim())
+                  ? parseInt(rawStatus.trim(), 10)
+                  : rawStatus;
+            err.statusCode = err.status;
+          }
+          err.envelope = envelope;
+          err.target = target;
+          throw err;
         }
       }
-
       if (Object.prototype.hasOwnProperty.call(envelope, "response")) {
         return envelope.response;
       }
@@ -1153,39 +1581,39 @@ class LightNovelShelf extends ComicSource {
   }
 
   /**
-   * 在已建立的 SignalR 会话中调用单个 Hub Method。
+   * 在同一个 WebSocket payload 中批量发送不同 Hub Method，
+   * 独立分配 invocationId，由 Receive Loop 统一按 invocationId 分发乱序到达的 Completion。
    */
-  async _hubInvoke(session, target, params) {
-    const results = await this._hubInvokeMany(session, target, [params]);
-    return results[0];
-  }
-
-  /**
-   * 在同一个 SignalR transport payload 中批量发送不同 Hub Method，
-   * 再按 invocationId 收集可能乱序到达的 Completion。
-   */
-  async _hubInvokeBatch(session, calls) {
+  async _hubInvokeBatch(socket, calls, options = {}) {
     if (!Array.isArray(calls) || calls.length === 0) {
       return [];
     }
 
+    const activeSocket = socket || this._hubSocket;
+    if (
+      !activeSocket ||
+      activeSocket.closed ||
+      activeSocket !== this._hubSocket ||
+      this._hubState !== "connected"
+    ) {
+      throw this._hubTransportError("轻书架网络通道未连接，无法发送请求");
+    }
+
+    const defaultRetryTransport = options.retryTransport === true;
+    const timeoutMs = this.constructor.hubInvocationTimeoutMs || 30000;
+    const itemGeneration = this._hubGeneration;
+
     const invocations = calls.map((call, index) => {
-      if (
-        !call ||
-        typeof call.target !== "string" ||
-        !call.target.trim()
-      ) {
+      if (!call || typeof call.target !== "string" || !call.target.trim()) {
         throw new Error(`无效 SignalR 批量调用: ${index}`);
       }
-
       const target = call.target.trim();
-      const invocationId = String(++session.seq);
+      const invocationId = String(++this._hubInvocationId);
       const message =
         JSON.stringify({
           type: 1,
           invocationId: invocationId,
           target: target,
-          // 官方 Web 默认 UseGzip=true；这里关闭 gzip，直接返回 JSON 对象。
           arguments: [call.params, { UseGzip: false }],
         }) + "\x1e";
 
@@ -1194,111 +1622,130 @@ class LightNovelShelf extends ComicSource {
         index: index,
         target: target,
         message: message,
+        retryTransport:
+          call.retryTransport !== undefined
+            ? call.retryTransport === true
+            : defaultRetryTransport,
       };
     });
 
-    const pending = new Map(
-      invocations.map((item) => [item.invocationId, item]),
-    );
-    const results = new Array(invocations.length);
+    const promises = invocations.map((item) => {
+      return new Promise((resolve, reject) => {
+        const pendingItem = {
+          invocationId: item.invocationId,
+          target: item.target,
+          retryTransport: item.retryTransport,
+          generation: itemGeneration,
+          sent: false,
+          settled: false,
+          resolve: (val) => {
+            if (!pendingItem.settled) {
+              pendingItem.settled = true;
+              resolve(val);
+            }
+          },
+          reject: (err) => {
+            if (!pendingItem.settled) {
+              pendingItem.settled = true;
+              reject(err);
+            }
+          },
+        };
+
+        this._hubPending.set(item.invocationId, pendingItem);
+
+        if (timeoutMs > 0) {
+          setTimeout(() => {
+            if (
+              !pendingItem.settled &&
+              itemGeneration === this._hubGeneration &&
+              this._hubPending.get(item.invocationId) === pendingItem
+            ) {
+              this._hubPending.delete(item.invocationId);
+              pendingItem.reject(
+                this._hubTimeoutError(
+                  `SignalR ${item.target} 调用响应超时 (${Math.round(timeoutMs / 1000)}秒)`,
+                ),
+              );
+            }
+          }, timeoutMs);
+        }
+      });
+    });
+
+    for (const p of promises) {
+      p.catch(() => {});
+    }
+    const batchPromise = Promise.all(promises);
+    batchPromise.catch(() => {});
+
     const payload = invocations.map((item) => item.message).join("");
-    const targets = [...new Set(invocations.map((item) => item.target))];
-    const label = targets.join(", ");
 
-    await this._hubTransportRequest(
-      `SignalR invoke ${label}`,
-      async () =>
-        await Network.post(
-          session.url,
-          this._sessionAuthTextHeaders(session),
-          payload,
-        ),
-    );
-
-    // 通常一次 poll 会携带多个 Completion；若服务端分批推送则继续轮询。
-    const maxPolls = Math.max(20, invocations.length * 2);
-
-    for (let i = 0; i < maxPolls; i++) {
-      const poll = await this._hubTransportRequest(
-        `SignalR poll ${label}`,
-        async () =>
-          await Network.get(
-            this._pollUrl(session),
-            this._pollHeaders(session),
-          ),
+    try {
+      await activeSocket.send(payload);
+      for (const item of invocations) {
+        const pending = this._hubPending.get(item.invocationId);
+        if (pending) pending.sent = true;
+      }
+    } catch (sendErr) {
+      const transportError = this._hubTransportError(
+        `发送 SignalR 请求失败: ${sendErr && sendErr.message ? sendErr.message : sendErr}`,
+        sendErr,
       );
-
-      for (const frame of this._frames(poll.body)) {
-        // type 1 = 服务端 Invocation（例如 OnMessage 公告）；type 6 = Ping。
-        if (frame.type === 1 || frame.type === 6) {
-          continue;
+      for (const item of invocations) {
+        const pending = this._hubPending.get(item.invocationId);
+        if (pending) {
+          this._hubPending.delete(item.invocationId);
+          pending.reject(transportError);
         }
-
-        if (frame.type === 7) {
-          throw this._hubTransportError(
-            `SignalR 服务端关闭连接${
-              frame.error ? `: ${frame.error}` : ""
-            }`,
-          );
-        }
-
-        if (frame.type !== 3) {
-          continue;
-        }
-
-        const invocationId = String(frame.invocationId);
-        const invocation = pending.get(invocationId);
-        if (!invocation) {
-          continue;
-        }
-
-        if (frame.error) {
-          throw `SignalR ${invocation.target} 调用失败: ${frame.error}`;
-        }
-
-        results[invocation.index] = this._unwrapHubResult(
-          invocation.target,
-          frame.result,
-        );
-        pending.delete(invocationId);
       }
-
-      if (pending.size === 0) {
-        return results;
-      }
+      await batchPromise.catch(() => {});
+      throw transportError;
     }
 
-    throw this._hubTransportError(
-      `等待 SignalR 批量调用返回结果超时（剩余 ${pending.size}/${invocations.length}）`,
-    );
+    return await batchPromise;
   }
 
-  /**
-   * 在同一个 SignalR transport payload 中批量发送同一 Hub Method。
-   */
-  async _hubInvokeMany(session, target, paramsList) {
+  async _hubInvoke(socket, target, params, options = {}) {
+    const results = await this._hubInvokeBatch(
+      socket,
+      [
+        {
+          target: target,
+          params: params,
+          retryTransport: options.retryTransport,
+        },
+      ],
+      options,
+    );
+    return results[0];
+  }
+
+  async _hubInvokeMany(socket, target, paramsList, options = {}) {
     if (!Array.isArray(paramsList) || paramsList.length === 0) {
       return [];
     }
-
     return await this._hubInvokeBatch(
-      session,
-      paramsList.map((params) => ({ target: target, params: params })),
+      socket,
+      paramsList.map((params) => ({
+        target: target,
+        params: params,
+        retryTransport: options.retryTransport,
+      })),
+      options,
     );
   }
 
   /**
-   * 串行租用共享 Hub 会话。Unauthorized 总是允许一次认证重试；
-   * 只有显式幂等读取允许一次 transport 重试，两类重试共享同一预算。
+   * 串行租用长期 WebSocket 会话。Unauthorized 触发一次令牌刷新重试；
+   * 仅当 retryTransport === true 的幂等读取允许在建连断开后安全重试一次。
+   * 非幂等状态修改在已发送未完成时断开，坚决抛出 LIGHTNOVELSHELF_HUB_NO_REPLAY。
    */
   async _runHubSession(operationName, operation, options = {}) {
     const authGeneration = this._authGeneration;
     const retryTransport = options.retryTransport === true;
-    this._hubIdleGeneration += 1;
-    this._hubOperationCount += 1;
 
     return await this._enqueueHubOperation(async () => {
-      let session = null;
       let succeeded = false;
       let retryCount = 0;
       let forceRefresh = false;
@@ -1311,31 +1758,38 @@ class LightNovelShelf extends ComicSource {
 
       try {
         while (true) {
+          let socket = null;
           try {
             assertCurrentAuth();
-            session = null;
-            session = await this._ensureSharedHubSession(forceRefresh);
+            socket = await this._ensureHubConnected(forceRefresh);
             forceRefresh = false;
             assertCurrentAuth();
-            const result = await operation(session);
+            const result = await operation(socket);
             assertCurrentAuth();
             succeeded = true;
             return result;
           } catch (error) {
+            if (this._isHubNoReplayError(error)) {
+              throw error;
+            }
+            if (this._isTerminalRefreshError(error)) {
+              throw error;
+            }
             assertCurrentAuth();
             const unauthorized = this._isUnauthorizedError(error);
             const transport = this._isHubTransportError(error);
-            const failedSession = session;
 
-            if (unauthorized || transport) {
-              this._discardSharedHubSession(failedSession);
-            }
             if (unauthorized) {
               this._clearSessionTokenIfOwned(
                 authGeneration,
-                failedSession && failedSession.refreshToken,
-                failedSession && failedSession.sessionToken,
+                this.loadData("refreshToken"),
+                this._sessionToken,
               );
+              this._disconnectHub("Unauthorized 401");
+            } else if (transport) {
+              if (socket && this._hubSocket === socket) {
+                this._disconnectHub("Transport error");
+              }
             }
 
             const canRetry =
@@ -1351,22 +1805,12 @@ class LightNovelShelf extends ComicSource {
           }
         }
       } finally {
-        this._hubOperationCount -= 1;
-
         if (
           succeeded &&
           operationName !== "SignIn" &&
           operationName !== "Prewarm"
         ) {
           this._tryAutoSignIn();
-        }
-
-        if (
-          session &&
-          this._sharedHubSession === session &&
-          this._hubOperationCount === 0
-        ) {
-          this._scheduleSharedHubClose(session);
         }
       }
     });
@@ -1375,7 +1819,7 @@ class LightNovelShelf extends ComicSource {
   async _hubCall(target, params, options = {}) {
     return await this._runHubSession(
       target,
-      async (session) => await this._hubInvoke(session, target, params),
+      async (socket) => await this._hubInvoke(socket, target, params, options),
       options,
     );
   }
@@ -1995,25 +2439,31 @@ class LightNovelShelf extends ComicSource {
       "LoadDiscovery",
       async (session) => {
         const [latestData, popularData, historyData] =
-          await this._hubInvokeBatch(session, [
-            {
-              target: "GetComicList",
-              params: {
-                Page: 1,
-                Size: LightNovelShelf.discoveryPageSize,
-                Order: "latest",
+          await this._hubInvokeBatch(
+            session,
+            [
+              {
+                target: "GetComicList",
+                params: {
+                  Page: 1,
+                  Size: LightNovelShelf.discoveryPageSize,
+                  Order: "latest",
+                },
+                retryTransport: true,
               },
-            },
-            {
-              target: "GetComicList",
-              params: {
-                Page: 1,
-                Size: LightNovelShelf.discoveryPageSize,
-                Order: "view",
+              {
+                target: "GetComicList",
+                params: {
+                  Page: 1,
+                  Size: LightNovelShelf.discoveryPageSize,
+                  Order: "view",
+                },
+                retryTransport: true,
               },
-            },
-            { target: "GetReadHistory", params: {} },
-          ]);
+              { target: "GetReadHistory", params: {}, retryTransport: true },
+            ],
+            { retryTransport: true },
+          );
 
         assertCurrentRequest();
         const historyIds = this._historyIdsFromResponse(historyData);
@@ -2028,6 +2478,7 @@ class LightNovelShelf extends ComicSource {
             session,
             "GetBookListByIds",
             { Ids: pageIds, Type: "Comic" },
+            { retryTransport: true },
           );
           assertCurrentRequest();
         }
@@ -2083,12 +2534,7 @@ class LightNovelShelf extends ComicSource {
     },
 
     logout: () => {
-      this.deleteData("account");
-      this.deleteData("refreshToken");
-      this.deleteData("visitorId");
-      this.deleteData("lastSignInUtcDate");
-      this._autoSignInAttemptDate = "";
-      this._invalidateAuthState();
+      this._clearAuthCredentials("User logout");
     },
   };
 
