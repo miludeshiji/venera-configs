@@ -27,6 +27,23 @@
  * 20. Hub 信封以数值 Status 401 与 -100 表达认证失效时触发 SessionToken 刷新与重试
  * 21. refresh HTTP 401/404 或 Status -100 终态失效原子清理凭据且绝不后台重试，网络错误仍退避
  * 22. 切换线路时旧线路刷新独立隔离，新线路发起独立 refresh 且旧线路晚到失败不清凭据
+ * 23. Token x-id 保持 opaque 值且已有值只 trim
+ * 24. Gzip Hub 响应解码并在 invocation 中启用 UseGzip
+ * 25. 滑动窗口按逻辑 invocation 计费并允许并发
+ * 26. 阅读进度保存准确且重复位置不重复写入
+ * 27. 评论使用代表 Book.Id 并保留结构化 ReplyId
+ * 28. 新版详情并发隔离 BookId、页数并禁用旧接口
+ * 29. 限流等待期间 socket 换代后非幂等请求安全重试一次
+ * 30. logout 立即取消限流 waiter 且旧回调不会恢复请求
+ * 31. 漫画元数据缓存按 LRU 上限淘汰最旧漫画
+ * 32. 冷启动精确解析并恢复多上传版本与 Book 评论
+ * 33. 同一系列并发复用搜索与全部 BookInfo 请求
+ * 34. ReplyComment 等非幂等调用在 socket.send 自身直接 reject 时可安全重试成功
+ * 35. BookInfo Cache TTL 到期后刷新拉取新章节
+ * 36. BookInfo Cache 达到容量上限时淘汰最旧条目
+ * 37. 漫画源基础元数据有效且与 index.json 保持强一致
+ * 38. BookInfo PageCount 更新后失效旧正文 total 与 batch
+ * 39. 详情更新时间取列表和 Book 的最新候选值
  */
 
 const fs = require("node:fs");
@@ -1062,6 +1079,7 @@ async function runTests() {
       source._sessionToken = "active-session-token";
       source._sessionTokenAt = Date.now();
       source._sessionTokenGeneration = source._authGeneration;
+      source._rememberRepresentativeBookId("comic-123", 123);
 
       let caughtError = null;
       let result = undefined;
@@ -1700,19 +1718,22 @@ async function runTests() {
     assert.strictEqual(calls[0].options.retryTransport, false);
   });
 
-  await test("27. 评论保留结构化回复目标并支持 ReplyId", async () => {
+  await test("27. 评论使用代表 Book.Id 并保留结构化 ReplyId", async () => {
     const { source } = createSourceHarness();
     const calls = [];
+    source._rememberRepresentativeBookId("series", 100);
     source._hubCall = async (target, params, options) => {
       calls.push({ target, params, options });
       return null;
     };
-    await source.comic.replyComment("series", null, "正文", "10//1", "11");
+    await source.comic.replyComment("series", "200", "正文", "10//1", "11");
     assert.strictEqual(calls[0].target, "ReplyComment");
+    assert.strictEqual(calls[0].params.Type, "Book");
+    assert.strictEqual(calls[0].params.Id, 200);
+    assert.strictEqual(calls[0].params.SeriesTitle, undefined);
     assert.strictEqual(calls[0].params.ParentId, 10);
     assert.strictEqual(calls[0].params.ReplyId, 11);
     assert.strictEqual(calls[0].options.retryTransport, false);
-
     const comment = source._commentFromResponse(
       { "11": { UserId: 7, Content: "原文" } },
       { "7": { UserName: "用户" } },
@@ -1722,22 +1743,37 @@ async function runTests() {
     assert.strictEqual(comment.content, "原文");
   });
 
-  await test("28. 并发乱序 loadInfo 保留多漫画 BookId 与 PageCount", async () => {
+  await test("28. 新版详情并发隔离 BookId、页数并禁用旧接口", async () => {
     const { source } = createSourceHarness();
-    let resolveA;
-    let resolveB;
-    const responses = {
-      A: new Promise((resolve) => {
-        resolveA = resolve;
-      }),
-      B: new Promise((resolve) => {
-        resolveB = resolve;
-      }),
-    };
     const saved = [];
+    const calls = [];
+    const book = (seriesTitle, bookId, pageCount) => ({
+      SeriesTitle: seriesTitle,
+      Series: [{ Id: bookId, Title: `${seriesTitle} book`, Cover: "" }],
+      Book: {
+        Id: bookId,
+        Type: "Comic",
+        Title: `${seriesTitle} book`,
+        Cover: "",
+        Author: "",
+        Introduction: "",
+        LastUpdatedAt: "2026-01-02T00:00:00Z",
+        CreatedAt: "2026-01-01T00:00:00Z",
+        User: { UserName: `${seriesTitle} uploader` },
+        Chapters: [
+          { Id: 456, SortNum: 1, Title: "chapter", PageCount: pageCount },
+        ],
+      },
+    });
+    source._comicFromListItem({ Id: 100, Title: "A" });
+    source._comicFromListItem({ Id: 200, Title: "B" });
     source._hubCall = async (target, params, options) => {
+      calls.push({ target, params, options });
       if (target === "GetComicSeriesInfo") {
-        return await responses[params.SeriesTitle];
+        throw new Error("legacy method must not be called");
+      }
+      if (target === "GetBookInfo") {
+        return params.Id === 100 ? book("A", 100, 10) : book("B", 200, 20);
       }
       if (target === "SaveReadPosition") {
         saved.push({ params, options });
@@ -1745,24 +1781,17 @@ async function runTests() {
       }
       throw new Error(`Unexpected Hub call: ${target}`);
     };
-    const response = (title, bookId, pageCount) => ({
-      Series: { Title: title },
-      Books: [
-        {
-          Id: bookId,
-          Title: `${title} book`,
-          Chapters: [{ Id: 456, Title: "chapter", PageCount: pageCount }],
-        },
-      ],
-    });
 
-    const loadA = source.comic.loadInfo("A");
-    const loadB = source.comic.loadInfo("B");
-    resolveB(response("B", 200, 20));
-    await loadB;
-    resolveA(response("A", 100, 10));
-    await loadA;
-
+    const [detailsA, detailsB] = await Promise.all([
+      source.comic.loadInfo("A"),
+      source.comic.loadInfo("B"),
+    ]);
+    assert.strictEqual(detailsA.subId, "100");
+    assert.strictEqual(detailsB.subId, "200");
+    assert.strictEqual(
+      calls.some((call) => call.target === "GetComicSeriesInfo"),
+      false,
+    );
     await source.comic.updateReadProgress("A", "456", 3);
     await source.comic.updateReadProgress("B", "456", 4);
     assert.deepStrictEqual(
@@ -1872,6 +1901,459 @@ async function runTests() {
       33,
     );
   });
+  await test("32. 冷启动精确解析并恢复多上传版本与 Book 评论", async () => {
+    const { source } = createSourceHarness();
+    const calls = [];
+    const response = (id, title, user, chapterId) => ({
+      SeriesTitle: "Series A",
+      Series: [
+        { Id: 100, Title: "单行本", Cover: "primary.jpg" },
+        { Id: 200, Title: "单行本", Cover: "secondary.jpg" },
+        { Id: 300, Title: "失败版本", Cover: "" },
+      ],
+      Book: {
+        Id: id,
+        Type: "Comic",
+        Title: title,
+        Cover: `${id}.jpg`,
+        Author: "作者",
+        Introduction: id === 100 ? "简介" : "",
+        LastUpdatedAt: `2026-01-0${id === 100 ? 2 : 3}T00:00:00Z`,
+        CreatedAt: `2025-01-0${id === 100 ? 2 : 1}T00:00:00Z`,
+        User: { UserName: user },
+        Extra: { classification: { tags: ["标签"] } },
+        Chapters: [
+          { Id: chapterId, SortNum: 1, Title: "第一话", PageCount: 6 },
+        ],
+      },
+    });
+    source._hubCall = async (target, params, options) => {
+      calls.push({ target, params, options });
+      if (target === "SearchComicSeries") {
+        return {
+          Data: [
+            { Id: 999, Title: "Series A 相似项" },
+            {
+              Id: 100,
+              Title: "Series A",
+              OriginalTitle: "Original A",
+              Cover: "series.jpg",
+              LastUpdatedAt: "2026-01-04T00:00:00Z",
+            },
+          ],
+        };
+      }
+      if (target === "GetBookInfo") {
+        if (params.Id === 100) return response(100, "单行本", "A", 1001);
+        if (params.Id === 200) return response(200, "单行本", "B", 2001);
+        throw new Error("secondary unavailable");
+      }
+      if (target === "GetComments") {
+        return { Data: [], Users: {}, Commentaries: {}, TotalPages: 1 };
+      }
+      throw new Error(`Unexpected Hub call: ${target}`);
+    };
+
+    const details = await source.comic.loadInfo("Series A");
+    assert.strictEqual(details.title, "Series A");
+    assert.strictEqual(details.subId, "100");
+    assert.strictEqual(details.cover, "https://api.lightnovel.life/series.jpg");
+    assert.deepStrictEqual(Array.from(details.chapters.keys()), [
+      "单行本（A）",
+      "单行本（B）",
+    ]);
+    assert.strictEqual(
+      source._comicChapterBookIds.get(
+        source._comicChapterBookIdKey("Series A", 2001),
+      ),
+      200,
+    );
+    await source.comic.loadComments("Series A", details.subId, 1, null);
+    const commentCall = calls.find((call) => call.target === "GetComments");
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(commentCall.params)), {
+      Type: "Book",
+      Id: 100,
+      Page: 1,
+    });
+    assert.strictEqual(
+      calls.filter((call) => call.target === "SearchComicSeries").length,
+      1,
+    );
+    assert.strictEqual(
+      calls.filter((call) => call.target === "GetBookInfo").length,
+      3,
+    );
+  });
+
+  await test("33. 同一系列并发复用搜索与全部 BookInfo 请求", async () => {
+    const { source } = createSourceHarness();
+    let searches = 0;
+    let bookCalls = 0;
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searches += 1;
+        return { Data: [{ Id: 100, Title: "Series A" }] };
+      }
+      if (target === "GetBookInfo") {
+        bookCalls += 1;
+        return {
+          SeriesTitle: "Series A",
+          Series: [{ Id: 100, Title: "A", Cover: "" }],
+          Book: {
+            Id: 100,
+            Type: "Comic",
+            Title: "A",
+            Cover: "",
+            Author: "",
+            Introduction: "",
+            User: { UserName: "U" },
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected Hub call: ${target}`);
+    };
+    const [a, b] = await Promise.all([
+      source.comic.loadInfo("Series A"),
+      source.comic.loadInfo("Series A"),
+    ]);
+    assert.strictEqual(a.title, b.title);
+    assert.strictEqual(searches, 1);
+    assert.strictEqual(bookCalls, 1);
+  });
+
+  await test("34. ReplyComment 等非幂等调用在 socket.send 自身直接 reject 时可安全重试成功", async () => {
+    let socketCount = 0;
+    const sockets = [];
+
+    const { source } = createSourceHarness({
+      WebSocket: {
+        connect: async (url, headers, options) => {
+          socketCount += 1;
+          const currentCount = socketCount;
+          const ws = new MockWebSocket(url, headers, options);
+          sockets.push(ws);
+          setTimeout(() => ws.pushMessage("{}\x1e"), 5);
+
+          if (currentCount === 1) {
+            let sendCalls = 0;
+            const originalSend = ws.send.bind(ws);
+            ws.send = async (data) => {
+              sendCalls += 1;
+              if (sendCalls === 1) {
+                return await originalSend(data);
+              }
+              throw new Error("底层 socket 在发送业务请求前断开 (mock pre-send error)");
+            };
+          } else {
+            const originalSend = ws.send.bind(ws);
+            ws.send = async (data) => {
+              await originalSend(data);
+              const frames = String(data).split("\x1e");
+              for (const f of frames) {
+                if (!f.trim()) continue;
+                try {
+                  const parsed = JSON.parse(f);
+                  if (parsed && parsed.target === "ReplyComment") {
+                    setTimeout(() => {
+                      ws.pushMessage(
+                        JSON.stringify({
+                          type: 3,
+                          invocationId: parsed.invocationId,
+                          result: {
+                            Success: true,
+                            Response: { Id: 999 },
+                          },
+                        }) + "\x1e",
+                      );
+                    }, 5);
+                  }
+                } catch (_) {}
+              }
+            };
+          }
+          return ws;
+        },
+      },
+    });
+
+    source._rememberRepresentativeBookId("comic-test", 123);
+    const result = await source.comic.replyComment(
+      "comic-test",
+      "123",
+      "安全重试评论",
+      "456//1",
+      "789",
+    );
+
+    assert.strictEqual(result, "ok", "非幂等调用遇 pre-send 失败重试后应成功完成并返回 ok");
+    assert.strictEqual(sockets.length, 2, "应创建第二个 socket 执行重试");
+    await source._disconnectHub("Test 34 complete");
+  });
+
+  await test("35. BookInfo Cache TTL 到期后刷新拉取新章节", async () => {
+    const { source } = createSourceHarness();
+    let getBookInfoCalls = 0;
+    const originalTtl = source.constructor.bookInfoCacheTtlMs;
+    source.constructor.bookInfoCacheTtlMs = 25; // 25ms TTL 用于快速测试
+
+    try {
+      source._hubCall = async (target, params) => {
+        if (target === "SearchComicSeries") {
+          return { Data: [{ Id: 100, Title: "Series TTL" }] };
+        }
+        if (target === "GetBookInfo") {
+          getBookInfoCalls += 1;
+          const chapters =
+            getBookInfoCalls === 1
+              ? [{ Id: 1, Title: "第 1 话" }]
+              : [{ Id: 1, Title: "第 1 话" }, { Id: 2, Title: "第 2 话" }];
+          return {
+            SeriesTitle: "Series TTL",
+            Series: [{ Id: 100, Title: "Series TTL", Cover: "" }],
+            Book: {
+              Id: 100,
+              Type: "Comic",
+              Title: "Series TTL",
+              Cover: "",
+              Author: "",
+              Introduction: "",
+              User: { UserName: "U" },
+              Chapters: chapters,
+            },
+          };
+        }
+        throw new Error(`Unexpected Hub call: ${target}`);
+      };
+
+      // 首次加载
+      const first = await source.comic.loadInfo("Series TTL");
+      assert.strictEqual(getBookInfoCalls, 1);
+      assert.strictEqual(first.chapters.get("Series TTL").size, 1);
+
+      // 立即再次加载，在 TTL 窗口内，应命中缓存
+      const second = await source.comic.loadInfo("Series TTL");
+      assert.strictEqual(getBookInfoCalls, 1, "TTL 窗口内应直接复用缓存");
+      assert.strictEqual(second.chapters.get("Series TTL").size, 1);
+
+      // 等待超过 TTL
+      await new Promise((resolve) => setTimeout(resolve, 35));
+
+      // 第三次加载，TTL 已过期，应重新请求并获取新章节
+      const third = await source.comic.loadInfo("Series TTL");
+      assert.strictEqual(getBookInfoCalls, 2, "TTL 过期后应重新调用 GetBookInfo");
+      assert.strictEqual(third.chapters.get("Series TTL").size, 2, "新请求应包含更新的第 2 话");
+    } finally {
+      source.constructor.bookInfoCacheTtlMs = originalTtl;
+    }
+  });
+
+  await test("36. BookInfo Cache 达到容量上限时淘汰最旧条目", async () => {
+    const { source } = createSourceHarness();
+    const originalLimit = source.constructor.bookInfoCacheLimit;
+    source.constructor.bookInfoCacheLimit = 2; // 上限设为 2
+
+    try {
+      source._hubCall = async (target, params) => {
+        if (target === "GetBookInfo") {
+          const id = params.Id;
+          return {
+            SeriesTitle: `Series ${id}`,
+            Series: [{ Id: id, Title: `Series ${id}`, Cover: "" }],
+            Book: {
+              Id: id,
+              Type: "Comic",
+              Title: `Series ${id}`,
+              Cover: "",
+              Author: "",
+              Introduction: "",
+              User: { UserName: "U" },
+              Chapters: [],
+            },
+          };
+        }
+        throw new Error(`Unexpected Hub call: ${target}`);
+      };
+
+      await source._getBookInfo(101);
+      await source._getBookInfo(102);
+      assert.strictEqual(source._bookInfoCache.size, 2);
+      const key101 = source._bookInfoCacheKey(101);
+      const key102 = source._bookInfoCacheKey(102);
+      assert.strictEqual(source._bookInfoCache.has(key101), true);
+      assert.strictEqual(source._bookInfoCache.has(key102), true);
+
+      // 加载第三部
+      await source._getBookInfo(103);
+      assert.strictEqual(source._bookInfoCache.size, 2, "缓存容量不得超过上限 2");
+      assert.strictEqual(source._bookInfoCache.has(key101), false, "最早的 key101 应当被驱逐淘汰");
+      assert.strictEqual(source._bookInfoCache.has(key102), true);
+      const key103 = source._bookInfoCacheKey(103);
+      assert.strictEqual(source._bookInfoCache.has(key103), true);
+    } finally {
+      source.constructor.bookInfoCacheLimit = originalLimit;
+    }
+  });
+
+  await test("37. 漫画源基础元数据有效且与 index.json 保持强一致", async () => {
+    const { source } = createSourceHarness();
+
+    assert.strictEqual(source.name, "轻书架");
+    assert.strictEqual(source.key, "LightNovelShelf");
+    assert.match(source.key, /^[a-zA-Z0-9_]+$/);
+    assert.strictEqual(source.version, "0.3.2");
+    assert.strictEqual(source.minAppVersion, "2.0.2");
+
+    const indexPath = path.resolve(__dirname, "../index.json");
+    const indexContent = fs.readFileSync(indexPath, "utf8");
+    const indexArray = JSON.parse(indexContent);
+    const entry = indexArray.find((item) => item && item.key === "LightNovelShelf");
+
+    assert.ok(entry, "index.json 中必须包含 LightNovelShelf 条目");
+    assert.strictEqual(entry.fileName, "lightnovelshelf.js");
+    assert.strictEqual(entry.key, source.key);
+    assert.strictEqual(entry.version, source.version);
+    assert.strictEqual(entry.name, source.name);
+  });
+
+  await test("38. BookInfo PageCount 更新后失效旧正文 total 与 batch", async () => {
+    const { source } = createSourceHarness();
+    let getBookInfoCalls = 0;
+    const originalTtl = source.constructor.bookInfoCacheTtlMs;
+    source.constructor.bookInfoCacheTtlMs = 25; // 25ms TTL 用于快速测试
+
+    try {
+      source._hubCall = async (target, params) => {
+        if (target === "SearchComicSeries") {
+          return { Data: [{ Id: 100, Title: "Series A" }] };
+        }
+        if (target === "GetBookInfo") {
+          getBookInfoCalls += 1;
+          const pageCount = getBookInfoCalls === 1 ? 6 : 8;
+          return {
+            SeriesTitle: "Series A",
+            Series: [{ Id: 100, Title: "Series A", Cover: "" }],
+            Book: {
+              Id: 100,
+              Type: "Comic",
+              Title: "Series A",
+              Cover: "",
+              Author: "",
+              Introduction: "",
+              User: { UserName: "U" },
+              Chapters: [
+                { Id: 1001, Title: "第 1 话", PageCount: pageCount },
+              ],
+            },
+          };
+        }
+        if (target === "GetComicContent") {
+          return {
+            Chapter: {
+              Total: 6,
+              Skip: params.Skip || 0,
+              Images: [
+                "img1.jpg",
+                "img2.jpg",
+                "img3.jpg",
+                "img4.jpg",
+                "img5.jpg",
+                "img6.jpg",
+              ],
+            },
+          };
+        }
+        throw new Error(`Unexpected Hub call: ${target}`);
+      };
+
+      // 首次加载详情并进入正文
+      await source.comic.loadInfo("Series A");
+      const first = await source.comic.loadEp("Series A", "1001");
+      assert.strictEqual(first.images.length, 6);
+
+      const stateKey = source._comicContentStateKey("Series A", 1001);
+      const oldState = source._comicContentStates.get(stateKey);
+      assert.ok(oldState);
+      assert.strictEqual(oldState.total, 6);
+
+      // 产生 batches 缓存
+      await source._loadComicContentBatch("Series A", 1001, 0);
+      assert.strictEqual(oldState.batches.size > 0, true);
+
+      // 等待超过 TTL，服务器 PageCount 更新为 8
+      await new Promise((resolve) => setTimeout(resolve, 35));
+
+      // 重新加载详情
+      await source.comic.loadInfo("Series A");
+
+      // 旧 state 应当被删除，batches 缓存一同丢弃
+      assert.strictEqual(source._comicContentStates.has(stateKey), false);
+
+      // 再次进入阅读器，生成新的 8 页
+      const second = await source.comic.loadEp("Series A", "1001");
+      assert.strictEqual(second.images.length, 8);
+    } finally {
+      source.constructor.bookInfoCacheTtlMs = originalTtl;
+    }
+  });
+
+  await test("39. 详情更新时间取列表和 Book 的最新候选值", async () => {
+    const { source } = createSourceHarness();
+
+    // 场景 A: metadata 较旧 (2026-09-01)，Book 较新 (2026-09-05) -> 应取 2026-09-05
+    source._rememberSeriesListMetadata({
+      Id: 101,
+      Title: "Series A",
+      LastUpdatedAt: "2026-09-01T00:00:00Z",
+    });
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "Series A",
+          Series: [{ Id: 101, Title: "Series A" }],
+          Book: {
+            Id: 101,
+            Type: "Comic",
+            Title: "Series A",
+            LastUpdatedAt: "2026-09-05T00:00:00Z",
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected Hub call: ${target}`);
+    };
+
+    const detailsA = await source.comic.loadInfo("Series A");
+    assert.strictEqual(detailsA.updateTime, "2026-09-05T00:00:00Z");
+
+    // 场景 B: metadata 较新 (2026-09-06)，Book 较旧 (2026-09-05) -> 应取 2026-09-06
+    source._clearComicContentStates();
+    source._rememberSeriesListMetadata({
+      Id: 102,
+      Title: "Series B",
+      LastUpdatedAt: "2026-09-06T00:00:00Z",
+    });
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "Series B",
+          Series: [{ Id: 102, Title: "Series B" }],
+          Book: {
+            Id: 102,
+            Type: "Comic",
+            Title: "Series B",
+            LastUpdatedAt: "2026-09-05T00:00:00Z",
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected Hub call: ${target}`);
+    };
+
+    const detailsB = await source.comic.loadInfo("Series B");
+    assert.strictEqual(detailsB.updateTime, "2026-09-06T00:00:00Z");
+  });
+
   assert.strictEqual(
     unhandledRejections.length,
     0,

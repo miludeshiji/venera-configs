@@ -206,7 +206,7 @@
         "name": "轻书架",
         "fileName": "lightnovelshelf.js",
         "key": "LightNovelShelf",
-        "version": "0.3.1",
-        "description": "轻书架漫画源，支持邮箱密码与 RefreshToken+x-id Token 登录、每日签到、WebSocket 长连接、Gzip 响应、9 次/5.5 秒请求调度、阅读进度单向保存及精确楼中楼回复"
+        "version": "0.3.2",
+        "description": "轻书架漫画源，支持新版 GetBookInfo 多上传版本详情、Book 评论、邮箱密码与 RefreshToken+x-id Token 登录、每日签到、WebSocket 长连接、Gzip 响应、9 次/5.5 秒请求调度及阅读进度保存"
     }
 ]
