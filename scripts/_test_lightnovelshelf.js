@@ -209,6 +209,8 @@ function createSourceHarness(customNetwork = {}, initialData = {}) {
     hexEncode: (buf) => Buffer.from(buf).toString("hex"),
     sha256: (buf) =>
       crypto.createHash("sha256").update(Buffer.from(buf)).digest(),
+    decodeBase64: (str) => Buffer.from(str, "base64"),
+    decodeGzip: (buf) => require("node:zlib").gunzipSync(Buffer.from(buf)),
   };
 
   const createUuid = () => "01234567-89ab-cdef-0123-456789abcdef";
@@ -978,7 +980,7 @@ async function runTests() {
   });
 
   // 14. 状态修改类非幂等调用遇断线坚决抛出 LIGHTNOVELSHELF_HUB_NO_REPLAY
-  await test("14. SignIn / PostComment / ReplyComment 真实入口发送后认证断线坚决保持 NO_REPLAY 且绝不重发", async () => {
+  await test("14. SignIn / PostComment / ReplyComment / SaveReadPosition 发送后断线坚决保持 NO_REPLAY 且绝不重发", async () => {
     const scenarios = [
       {
         name: "_performDailySignIn (SignIn 直接生产边界)",
@@ -1002,6 +1004,18 @@ async function runTests() {
         name: "comic.sendComment ReplyComment (回复评论)",
         target: "ReplyComment",
         invoke: (s) => s.comic.sendComment("comic-123", "sub-1", "测试回复评论", "456//1"),
+        expectThrow: true,
+      },
+      {
+        name: "comic.updateReadProgress SaveReadPosition (保存阅读进度)",
+        target: "SaveReadPosition",
+        invoke: (s) => {
+          s._comicChapterBookIds.set(
+            s._comicChapterBookIdKey("comic-123", 456),
+            123,
+          );
+          return s.comic.updateReadProgress("comic-123", "456", 5);
+        },
         expectThrow: true,
       },
     ];
@@ -1613,6 +1627,251 @@ async function runTests() {
     await source._disconnectHub("Test completed");
   });
 
+
+  await test("23. Token x-id 保持 opaque 值且已有值只 trim", async () => {
+    const opaque = "AbC-官方-ID";
+    const { source, dataStore } = createSourceHarness({}, {
+      visitorId: `  ${opaque}  `,
+    });
+    assert.strictEqual(source._getVisitorId(), opaque);
+    assert.strictEqual(dataStore.get("visitorId"), `  ${opaque}  `);
+    await source._loginWithToken(" refresh-token ", ` ${opaque} `);
+    assert.strictEqual(dataStore.get("visitorId"), opaque);
+  });
+
+  await test("24. Gzip Hub 响应解码并在 invocation 中启用 UseGzip", async () => {
+    const { source } = createSourceHarness();
+    const payload = require("node:zlib").gzipSync(
+      Buffer.from(JSON.stringify({ 中文: "正常" }), "utf8"),
+    );
+    const encoded = payload.toString("base64");
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(source._decodeHubResponse(encoded))),
+      { 中文: "正常" },
+    );
+    assert.strictEqual(source._decodeHubResponse("plain"), "plain");
+
+    const socket = new MockWebSocket("wss://test");
+    source._hubSocket = socket;
+    source._hubState = "connected";
+    const call = source._hubInvoke(socket, "Compressed", {});
+    await delay(0);
+    const frame = JSON.parse(socket.sentData[0].split("\x1e")[0]);
+    assert.strictEqual(frame.arguments[1].UseGzip, true);
+    source._hubPending.get(frame.invocationId).resolve("ok");
+    source._hubPending.delete(frame.invocationId);
+    assert.strictEqual(await call, "ok");
+  });
+
+  await test("25. 滑动窗口按逻辑 invocation 计费并允许并发", async () => {
+    const { source } = createSourceHarness();
+    source.constructor.hubRateLimitMax = 9;
+    source.constructor.hubRateLimitWindowMs = 30;
+    await source._acquireHubRateSlots(9);
+    let released = false;
+    const tenth = source._acquireHubRateSlots(1).then(() => {
+      released = true;
+    });
+    await delay(10);
+    assert.strictEqual(released, false);
+    await tenth;
+    assert.strictEqual(released, true);
+  });
+
+  await test("26. 阅读进度保存准确且重复位置不重复写入", async () => {
+    const { source } = createSourceHarness();
+    const calls = [];
+    source._hubCall = async (target, params, options) => {
+      calls.push({ target, params, options });
+      return null;
+    };
+    source._comicChapterBookIds.set(
+      source._comicChapterBookIdKey("series", 456),
+      123,
+    );
+    await source.comic.updateReadProgress("series", "456", 5);
+    await source.comic.updateReadProgress("series", "456", 5);
+    assert.strictEqual(calls.length, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(calls[0].params)), {
+      Bid: 123,
+      Cid: 456,
+      XPath: "5",
+    });
+    assert.strictEqual(calls[0].options.retryTransport, false);
+  });
+
+  await test("27. 评论保留结构化回复目标并支持 ReplyId", async () => {
+    const { source } = createSourceHarness();
+    const calls = [];
+    source._hubCall = async (target, params, options) => {
+      calls.push({ target, params, options });
+      return null;
+    };
+    await source.comic.replyComment("series", null, "正文", "10//1", "11");
+    assert.strictEqual(calls[0].target, "ReplyComment");
+    assert.strictEqual(calls[0].params.ParentId, 10);
+    assert.strictEqual(calls[0].params.ReplyId, 11);
+    assert.strictEqual(calls[0].options.retryTransport, false);
+
+    const comment = source._commentFromResponse(
+      { "11": { UserId: 7, Content: "原文" } },
+      { "7": { UserName: "用户" } },
+      11,
+    );
+    assert.strictEqual(comment.userId, "7");
+    assert.strictEqual(comment.content, "原文");
+  });
+
+  await test("28. 并发乱序 loadInfo 保留多漫画 BookId 与 PageCount", async () => {
+    const { source } = createSourceHarness();
+    let resolveA;
+    let resolveB;
+    const responses = {
+      A: new Promise((resolve) => {
+        resolveA = resolve;
+      }),
+      B: new Promise((resolve) => {
+        resolveB = resolve;
+      }),
+    };
+    const saved = [];
+    source._hubCall = async (target, params, options) => {
+      if (target === "GetComicSeriesInfo") {
+        return await responses[params.SeriesTitle];
+      }
+      if (target === "SaveReadPosition") {
+        saved.push({ params, options });
+        return null;
+      }
+      throw new Error(`Unexpected Hub call: ${target}`);
+    };
+    const response = (title, bookId, pageCount) => ({
+      Series: { Title: title },
+      Books: [
+        {
+          Id: bookId,
+          Title: `${title} book`,
+          Chapters: [{ Id: 456, Title: "chapter", PageCount: pageCount }],
+        },
+      ],
+    });
+
+    const loadA = source.comic.loadInfo("A");
+    const loadB = source.comic.loadInfo("B");
+    resolveB(response("B", 200, 20));
+    await loadB;
+    resolveA(response("A", 100, 10));
+    await loadA;
+
+    await source.comic.updateReadProgress("A", "456", 3);
+    await source.comic.updateReadProgress("B", "456", 4);
+    assert.deepStrictEqual(
+      saved.map((item) => JSON.parse(JSON.stringify(item.params))),
+      [
+        { Bid: 100, Cid: 456, XPath: "3" },
+        { Bid: 200, Cid: 456, XPath: "4" },
+      ],
+    );
+    assert.strictEqual(source._knownComicPageCount("A", 456), 10);
+    assert.strictEqual(source._knownComicPageCount("B", 456), 20);
+  });
+
+  await test("29. 限流等待期间 socket 换代后非幂等请求安全重试一次", async () => {
+    const { source } = createSourceHarness();
+    source.constructor.hubRateLimitWindowMs = 30;
+    await source._acquireHubRateSlots(9);
+    const socketA = new MockWebSocket("wss://old");
+    const socketB = new MockWebSocket("wss://new");
+    source._hubSocket = socketA;
+    source._hubState = "connected";
+    source._ensureHubConnected = async () => source._hubSocket;
+    const originalSendB = socketB.send.bind(socketB);
+    socketB.send = async (data) => {
+      await originalSendB(data);
+      const frame = JSON.parse(String(data).split("\x1e")[0]);
+      setTimeout(() => {
+        const pending = source._hubPending.get(frame.invocationId);
+        if (pending) {
+          source._hubPending.delete(frame.invocationId);
+          pending.resolve("sent-on-new-socket");
+        }
+      }, 0);
+    };
+
+    const call = source._hubCall(
+      "ReplyComment",
+      { ParentId: 1, Content: "reply" },
+      { retryTransport: false },
+    );
+    await delay(5);
+    source._hubSocket = socketB;
+    source._hubState = "connected";
+    assert.strictEqual(await call, "sent-on-new-socket");
+    assert.strictEqual(socketA.sentData.length, 0);
+    assert.strictEqual(socketB.sentData.length, 1);
+  });
+
+  await test("30. logout 立即取消限流 waiter 且旧回调不会恢复请求", async () => {
+    const { source } = createSourceHarness();
+    source.constructor.hubRateLimitWindowMs = 30;
+    await source._acquireHubRateSlots(9);
+    let error = null;
+    const waiting = source._acquireHubRateSlots(1).catch((caught) => {
+      error = caught;
+    });
+    await delay(5);
+    assert.strictEqual(source._hubRateWaiters.length, 1);
+    source.account.logout();
+    await waiting;
+    assert.ok(error);
+    assert.strictEqual(error.safeToRetry, true);
+    assert.strictEqual(source._hubRateWaiters.length, 0);
+    assert.strictEqual(source._hubRateTimestamps.length, 9);
+    await delay(35);
+    assert.strictEqual(source._hubRateWaiters.length, 0);
+  });
+
+  await test("31. 漫画元数据缓存按 LRU 上限淘汰最旧漫画", async () => {
+    const { source } = createSourceHarness();
+    source.constructor.comicMetadataCacheLimit = 2;
+    const add = (comicId, chapterId, bookId, pageCount) => {
+      const books = new Map([
+        [source._comicChapterBookIdKey(comicId, chapterId), bookId],
+      ]);
+      const pages = new Map([
+        [source._comicContentStateKey(comicId, chapterId), pageCount],
+      ]);
+      source._mergeComicMetadataCache(
+        comicId,
+        books,
+        pages,
+        source.apiBase,
+        source._authGeneration,
+      );
+    };
+    add("A", 1, 101, 11);
+    add("B", 2, 202, 22);
+    add("C", 3, 303, 33);
+    assert.strictEqual(source._comicMetadataKeys.size, 2);
+    assert.strictEqual(
+      source._comicChapterBookIds.has(
+        source._comicChapterBookIdKey("A", 1),
+      ),
+      false,
+    );
+    assert.strictEqual(
+      source._comicChapterBookIds.get(
+        source._comicChapterBookIdKey("B", 2),
+      ),
+      202,
+    );
+    assert.strictEqual(
+      source._comicChapterPageCounts.get(
+        source._comicContentStateKey("C", 3),
+      ),
+      33,
+    );
+  });
   assert.strictEqual(
     unhandledRejections.length,
     0,

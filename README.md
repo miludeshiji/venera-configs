@@ -31,6 +31,7 @@
    - 源文件地址：`https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js`
 2. 登录：
    邮箱登录：打开账号登录，输入轻书架注册邮箱和密码。
+   Token 登录：在源设置中选择“Token 登录”，输入 `RefreshToken|x-id`；`x-id` 仅去除首尾空白，不会被改写。
 
 ## 设置
 

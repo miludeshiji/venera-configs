@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.2.19
+ * 版本：0.3.1
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -24,19 +24,21 @@ class LightNovelShelf extends ComicSource {
   static comicContentPageSize = 6;
   static comicPageKeyPrefix = "lightnovelshelf-page://";
   static comicContentStateLimit = 3;
+  static comicMetadataCacheLimit = 8;
   static hubPingIntervalMs = 15000;
   static hubInvocationTimeoutMs = 30000;
   static hubConnectTimeoutMs = 30000;
   static hubHandshakeTimeoutMs = 30000;
   static hubReconnectDelays = [0, 5000, 10000, 20000, 30000];
+  static hubRateLimitMax = 9;
+  static hubRateLimitWindowMs = 5500;
   static hubNoReplayMessage =
     "轻书架连接结果不确定，为避免重复操作，本次请求不会自动重放";
   static tokenLoginFormatError =
     "请输入 RefreshToken 和 x-id，并用 ， , ； ; 或 | 分隔";
 
   name = "轻书架";
-  key = "LightNovelShelf";
-  version = "0.2.19";
+  version = "0.3.1";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -89,10 +91,16 @@ class LightNovelShelf extends ComicSource {
   _hubInvocationId = 0;
   _hubPending = new Map();
   _hubReceiveBuffer = "";
-  _hubOperationQueue = Promise.resolve();
+  _hubRateTimestamps = [];
+  _hubRateWaiters = [];
+  _hubRateProcessing = false;
+  _hubRateProcessToken = 0;
   // 章节正文按章节和 6 页批次缓存共享 Promise。
   _comicContentStates = new Map();
   _comicChapterPageCounts = new Map();
+  _comicChapterBookIds = new Map();
+  _comicMetadataKeys = new Map();
+  _lastSubmittedReadProgress = "";
   _comicContentUseSequence = 0;
 
   get apiBase() {
@@ -357,13 +365,13 @@ class LightNovelShelf extends ComicSource {
 
   _getVisitorId() {
     const saved = this.loadData("visitorId");
-    const normalizedSaved = this._normalizeVisitorId(saved);
 
-    if (/^[0-9a-f]{32}$/.test(normalizedSaved)) {
-      if (saved !== normalizedSaved) {
-        this.saveData("visitorId", normalizedSaved);
-      }
-      return normalizedSaved;
+    if (
+      saved !== undefined &&
+      saved !== null &&
+      String(saved).trim()
+    ) {
+      return String(saved).trim();
     }
 
     const generated = this._normalizeVisitorId(createUuid());
@@ -693,13 +701,15 @@ class LightNovelShelf extends ComicSource {
     const refreshToken = String(
       refreshTokenValue == null ? "" : refreshTokenValue,
     ).trim();
-    const visitorId = this._normalizeVisitorId(visitorIdValue);
+    const visitorId = String(
+      visitorIdValue == null ? "" : visitorIdValue,
+    ).trim();
 
     if (!refreshToken) {
       throw new Error("轻书架 Token 登录失败：RefreshToken 不能为空");
     }
-    if (!/^[0-9a-f]{32}$/.test(visitorId)) {
-      throw new Error("轻书架 Token 登录失败：x-id 必须为 32 位十六进制字符串");
+    if (!visitorId) {
+      throw new Error("轻书架 Token 登录失败：x-id 不能为空");
     }
 
     const authGeneration = this._authGeneration;
@@ -878,6 +888,12 @@ class LightNovelShelf extends ComicSource {
     const error = new Error(String(message));
     error.code = "LIGHTNOVELSHELF_HUB_TRANSPORT";
     if (cause !== undefined) error.cause = cause;
+    return error;
+  }
+
+  _hubPreSendTransportError(message, cause) {
+    const error = this._hubTransportError(message, cause);
+    error.safeToRetry = true;
     return error;
   }
 
@@ -1454,7 +1470,10 @@ class LightNovelShelf extends ComicSource {
           }
         } else {
           item.reject(
-            this._hubTransportError("轻书架网络通道在发送前已断开", error),
+            this._hubPreSendTransportError(
+              "轻书架网络通道在发送前已断开",
+              error,
+            ),
           );
         }
       }
@@ -1495,6 +1514,7 @@ class LightNovelShelf extends ComicSource {
   _disconnectHub(reason = "Disconnected") {
     this._hubDesiredConnected = false;
     this._hubGeneration += 1;
+    this._cancelHubRateWaiters(`轻书架请求已取消 (${reason})`);
     this._clearHubReconnectTimer();
     this._stopHubPing();
     this._hubState = "disconnected";
@@ -1518,14 +1538,118 @@ class LightNovelShelf extends ComicSource {
       this._closeSocketSafely(socket, 1000, reason);
     }
   }
+  async _acquireHubRateSlots(count) {
+    const max = this.constructor.hubRateLimitMax;
+    if (!Number.isSafeInteger(count) || count < 1 || count > max) {
+      throw new Error(`无效 SignalR 限流额度: ${count}`);
+    }
 
-  _enqueueHubOperation(operation) {
-    const queued = this._hubOperationQueue.then(operation, operation);
-    this._hubOperationQueue = queued.then(
-      () => undefined,
-      () => undefined,
-    );
-    return queued;
+    return await new Promise((resolve, reject) => {
+      this._hubRateWaiters.push({
+        count: count,
+        resolve: resolve,
+        reject: reject,
+        authGeneration: this._authGeneration,
+        hubGeneration: this._hubGeneration,
+      });
+      this._processHubRateWaiters();
+    });
+  }
+
+  _cancelHubRateWaiters(reason) {
+    if (this._hubRateWaiters.length === 0) return;
+    const error = this._hubPreSendTransportError(reason);
+    const waiters = this._hubRateWaiters;
+    this._hubRateWaiters = [];
+    this._hubRateProcessToken += 1;
+    this._hubRateProcessing = false;
+    for (const waiter of waiters) {
+      waiter.reject(error);
+    }
+  }
+
+  _processHubRateWaiters() {
+    if (this._hubRateProcessing) return;
+    this._hubRateProcessing = true;
+    const token = ++this._hubRateProcessToken;
+
+    const process = () => {
+      if (token !== this._hubRateProcessToken) return;
+      const now = Date.now();
+      const windowMs = this.constructor.hubRateLimitWindowMs;
+      while (
+        this._hubRateTimestamps.length > 0 &&
+        now - this._hubRateTimestamps[0] >= windowMs
+      ) {
+        this._hubRateTimestamps.shift();
+      }
+
+      const waiter = this._hubRateWaiters[0];
+      if (!waiter) {
+        this._hubRateProcessing = false;
+        return;
+      }
+      if (
+        waiter.authGeneration !== this._authGeneration ||
+        waiter.hubGeneration !== this._hubGeneration
+      ) {
+        this._hubRateWaiters.shift();
+        waiter.reject(
+          this._hubPreSendTransportError("轻书架连接状态已变更，请重试"),
+        );
+        process();
+        return;
+      }
+
+      if (
+        this._hubRateTimestamps.length + waiter.count <=
+        this.constructor.hubRateLimitMax
+      ) {
+        this._hubRateWaiters.shift();
+        for (let i = 0; i < waiter.count; i++) {
+          this._hubRateTimestamps.push(now);
+        }
+        waiter.resolve();
+        process();
+        return;
+      }
+
+      const delay = Math.max(
+        1,
+        windowMs - (now - this._hubRateTimestamps[0]),
+      );
+      setTimeout(process, delay);
+    };
+
+    process();
+  }
+
+  _decodeHubResponse(value) {
+    if (typeof value !== "string") return value;
+
+    let bytes;
+    try {
+      bytes = Convert.decodeBase64(value);
+    } catch (_) {
+      return value;
+    }
+    if (
+      !bytes ||
+      bytes.length < 2 ||
+      bytes[0] !== 0x1f ||
+      bytes[1] !== 0x8b
+    ) {
+      return value;
+    }
+    if (typeof Convert.decodeGzip !== "function") {
+      throw new Error("当前 Venera 版本不支持轻书架 Gzip 响应");
+    }
+
+    try {
+      return JSON.parse(Convert.decodeUtf8(Convert.decodeGzip(bytes)));
+    } catch (error) {
+      throw new Error("轻书架返回了无效的 Gzip 响应");
+    }
   }
 
   _unwrapHubResult(target, envelope) {
@@ -1568,12 +1692,14 @@ class LightNovelShelf extends ComicSource {
           throw err;
         }
       }
-      if (Object.prototype.hasOwnProperty.call(envelope, "response")) {
-        return envelope.response;
-      }
-
-      if (Object.prototype.hasOwnProperty.call(envelope, "Response")) {
-        return envelope.Response;
+      const response = Object.prototype.hasOwnProperty.call(envelope, "response")
+        ? envelope.response
+        : envelope.Response;
+      if (
+        Object.prototype.hasOwnProperty.call(envelope, "response") ||
+        Object.prototype.hasOwnProperty.call(envelope, "Response")
+      ) {
+        return this._decodeHubResponse(response);
       }
     }
 
@@ -1589,6 +1715,23 @@ class LightNovelShelf extends ComicSource {
       return [];
     }
 
+    const max = this.constructor.hubRateLimitMax;
+    if (calls.length > max) {
+      const results = [];
+      for (let start = 0; start < calls.length; start += max) {
+        results.push(
+          ...(await this._hubInvokeBatch(
+            socket,
+            calls.slice(start, start + max),
+            options,
+          )),
+        );
+      }
+      return results;
+    }
+
+    await this._acquireHubRateSlots(calls.length);
+
     const activeSocket = socket || this._hubSocket;
     if (
       !activeSocket ||
@@ -1596,12 +1739,15 @@ class LightNovelShelf extends ComicSource {
       activeSocket !== this._hubSocket ||
       this._hubState !== "connected"
     ) {
-      throw this._hubTransportError("轻书架网络通道未连接，无法发送请求");
+      throw this._hubPreSendTransportError(
+        "轻书架网络通道在发送请求前已失效",
+      );
     }
 
     const defaultRetryTransport = options.retryTransport === true;
     const timeoutMs = this.constructor.hubInvocationTimeoutMs || 30000;
     const itemGeneration = this._hubGeneration;
+    const useGzip = typeof Convert.decodeGzip === "function";
 
     const invocations = calls.map((call, index) => {
       if (!call || typeof call.target !== "string" || !call.target.trim()) {
@@ -1614,12 +1760,11 @@ class LightNovelShelf extends ComicSource {
           type: 1,
           invocationId: invocationId,
           target: target,
-          arguments: [call.params, { UseGzip: false }],
+          arguments: [call.params, { UseGzip: useGzip }],
         }) + "\x1e";
 
       return {
         invocationId: invocationId,
-        index: index,
         target: target,
         message: message,
         retryTransport:
@@ -1653,7 +1798,6 @@ class LightNovelShelf extends ComicSource {
         };
 
         this._hubPending.set(item.invocationId, pendingItem);
-
         if (timeoutMs > 0) {
           setTimeout(() => {
             if (
@@ -1673,12 +1817,9 @@ class LightNovelShelf extends ComicSource {
       });
     });
 
-    for (const p of promises) {
-      p.catch(() => {});
-    }
+    for (const promise of promises) promise.catch(() => {});
     const batchPromise = Promise.all(promises);
     batchPromise.catch(() => {});
-
     const payload = invocations.map((item) => item.message).join("");
 
     try {
@@ -1737,7 +1878,7 @@ class LightNovelShelf extends ComicSource {
   }
 
   /**
-   * 串行租用长期 WebSocket 会话。Unauthorized 触发一次令牌刷新重试；
+   * 并发复用长期 WebSocket 会话。Unauthorized 触发一次令牌刷新重试；
    * 仅当 retryTransport === true 的幂等读取允许在建连断开后安全重试一次。
    * 非幂等状态修改在已发送未完成时断开，坚决抛出 LIGHTNOVELSHELF_HUB_NO_REPLAY。
    */
@@ -1745,7 +1886,7 @@ class LightNovelShelf extends ComicSource {
     const authGeneration = this._authGeneration;
     const retryTransport = options.retryTransport === true;
 
-    return await this._enqueueHubOperation(async () => {
+    return await (async () => {
       let succeeded = false;
       let retryCount = 0;
       let forceRefresh = false;
@@ -1778,6 +1919,8 @@ class LightNovelShelf extends ComicSource {
             assertCurrentAuth();
             const unauthorized = this._isUnauthorizedError(error);
             const transport = this._isHubTransportError(error);
+            const safePreSendRetry =
+              transport && error && error.safeToRetry === true;
 
             if (unauthorized) {
               this._clearSessionTokenIfOwned(
@@ -1794,9 +1937,11 @@ class LightNovelShelf extends ComicSource {
 
             const canRetry =
               retryCount === 0 &&
-              (unauthorized || (transport && retryTransport));
+              (unauthorized || safePreSendRetry || (transport && retryTransport));
             if (!canRetry) {
-              if (transport) throw this._hubNoReplayError(error);
+              if (transport && !safePreSendRetry) {
+                throw this._hubNoReplayError(error);
+              }
               throw error;
             }
 
@@ -1813,7 +1958,7 @@ class LightNovelShelf extends ComicSource {
           this._tryAutoSignIn();
         }
       }
-    });
+    })();
   }
 
   async _hubCall(target, params, options = {}) {
@@ -1885,15 +2030,19 @@ class LightNovelShelf extends ComicSource {
   _clearComicContentStates() {
     this._comicContentStates.clear();
     this._comicChapterPageCounts.clear();
+    this._comicChapterBookIds.clear();
+    this._comicMetadataKeys.clear();
+    this._lastSubmittedReadProgress = "";
     this._comicContentUseSequence = 0;
   }
 
   _comicContentStateKey(
+    comicId,
     chapterId,
     apiBase = this.apiBase,
     authGeneration = this._authGeneration,
   ) {
-    return `${apiBase}\n${authGeneration}\n${chapterId}`;
+    return `${apiBase}\n${authGeneration}\n${String(comicId)}\n${chapterId}`;
   }
 
   _touchComicContentState(key, state) {
@@ -1917,13 +2066,78 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
-  _getComicContentState(chapterId) {
-    const key = this._comicContentStateKey(chapterId);
+  _comicChapterBookIdKey(
+    comicId,
+    chapterId,
+    apiBase = this.apiBase,
+    authGeneration = this._authGeneration,
+  ) {
+    return `${apiBase}\n${authGeneration}\n${String(comicId)}\n${chapterId}`;
+  }
+
+  _comicMetadataCacheKey(
+    comicId,
+    apiBase = this.apiBase,
+    authGeneration = this._authGeneration,
+  ) {
+    return `${apiBase}\n${authGeneration}\n${String(comicId)}`;
+  }
+
+  _mergeComicMetadataCache(
+    comicId,
+    chapterBookIds,
+    chapterPageCounts,
+    apiBase,
+    authGeneration,
+  ) {
+    const cacheKey = this._comicMetadataCacheKey(
+      comicId,
+      apiBase,
+      authGeneration,
+    );
+    const previous = this._comicMetadataKeys.get(cacheKey);
+    if (previous) {
+      for (const key of previous.bookKeys) this._comicChapterBookIds.delete(key);
+      for (const key of previous.pageKeys) {
+        this._comicChapterPageCounts.delete(key);
+      }
+      this._comicMetadataKeys.delete(cacheKey);
+    }
+
+    for (const [key, value] of chapterBookIds) {
+      this._comicChapterBookIds.set(key, value);
+    }
+    for (const [key, value] of chapterPageCounts) {
+      this._comicChapterPageCounts.set(key, value);
+    }
+    this._comicMetadataKeys.set(cacheKey, {
+      bookKeys: new Set(chapterBookIds.keys()),
+      pageKeys: new Set(chapterPageCounts.keys()),
+    });
+
+    while (
+      this._comicMetadataKeys.size >
+      this.constructor.comicMetadataCacheLimit
+    ) {
+      const oldestKey = this._comicMetadataKeys.keys().next().value;
+      const oldest = this._comicMetadataKeys.get(oldestKey);
+      this._comicMetadataKeys.delete(oldestKey);
+      if (!oldest) continue;
+      for (const key of oldest.bookKeys) this._comicChapterBookIds.delete(key);
+      for (const key of oldest.pageKeys) {
+        this._comicChapterPageCounts.delete(key);
+      }
+    }
+  }
+
+  _getComicContentState(comicId, chapterId) {
+    const key = this._comicContentStateKey(comicId, chapterId);
     let state = this._comicContentStates.get(key);
     if (!state) {
       state = {
         apiBase: this.apiBase,
         authGeneration: this._authGeneration,
+        comicId: String(comicId),
         chapterId: chapterId,
         total: null,
         batches: new Map(),
@@ -1934,12 +2148,12 @@ class LightNovelShelf extends ComicSource {
     return state;
   }
 
-  _knownComicPageCount(chapterId) {
-    const state = this._getComicContentState(chapterId);
+  _knownComicPageCount(comicId, chapterId) {
+    const state = this._getComicContentState(comicId, chapterId);
     if (state.total !== null) return state.total;
 
     const pageCount = this._comicChapterPageCounts.get(
-      this._comicContentStateKey(chapterId),
+      this._comicContentStateKey(comicId, chapterId),
     );
     if (Number.isSafeInteger(pageCount) && pageCount >= 0) {
       state.total = pageCount;
@@ -1997,8 +2211,8 @@ class LightNovelShelf extends ComicSource {
     return { skip: requestedSkip, total: total, images: images };
   }
 
-  async _loadComicContentBatch(chapterId, skip) {
-    const state = this._getComicContentState(chapterId);
+  async _loadComicContentBatch(comicId, chapterId, skip) {
+    const state = this._getComicContentState(comicId, chapterId);
     const existing = state.batches.get(skip);
     if (existing) return await existing;
 
@@ -2026,7 +2240,7 @@ class LightNovelShelf extends ComicSource {
         );
       }
       state.total = batch.total;
-      const stateKey = this._comicContentStateKey(chapterId);
+      const stateKey = this._comicContentStateKey(comicId, chapterId);
       if (this._comicContentStates.get(stateKey) === state) {
         this._touchComicContentState(stateKey, state);
       }
@@ -2148,6 +2362,8 @@ class LightNovelShelf extends ComicSource {
       userName: String(rawUserName || "未知用户"),
       content: String(rawContent == null ? "" : rawContent),
       id: String(options.id === undefined ? id : options.id),
+      userId:
+        userId === null || userId === undefined ? null : String(userId),
     };
 
     if (rawAvatar) {
@@ -2651,6 +2867,7 @@ class LightNovelShelf extends ComicSource {
       const booksRaw = this._value(data, "books", "Books", []);
       const books = Array.isArray(booksRaw) ? booksRaw : [];
       const chapterPageCounts = new Map();
+      const chapterBookIds = new Map();
 
       if (!series) {
         throw "GetComicSeriesInfo 未返回 series/Series";
@@ -2675,6 +2892,7 @@ class LightNovelShelf extends ComicSource {
 
       for (let bookIndex = 0; bookIndex < books.length; bookIndex++) {
         const book = books[bookIndex];
+        const bookId = Number(this._value(book, "id", "Id", NaN));
         const chaptersRaw = this._value(book, "chapters", "Chapters", []);
         const list = (Array.isArray(chaptersRaw) ? chaptersRaw : [])
           .slice()
@@ -2735,11 +2953,27 @@ class LightNovelShelf extends ComicSource {
           ) {
             chapterPageCounts.set(
               this._comicContentStateKey(
+                id,
                 normalizedChapterId,
                 pageCountApiBase,
                 pageCountAuthGeneration,
               ),
               pageCount,
+            );
+          }
+          if (
+            normalizedChapterId !== null &&
+            Number.isSafeInteger(bookId) &&
+            bookId > 0
+          ) {
+            chapterBookIds.set(
+              this._comicChapterBookIdKey(
+                id,
+                normalizedChapterId,
+                pageCountApiBase,
+                pageCountAuthGeneration,
+              ),
+              bookId,
             );
           }
 
@@ -2792,7 +3026,13 @@ class LightNovelShelf extends ComicSource {
         pageCountApiBase === this.apiBase &&
         pageCountAuthGeneration === this._authGeneration
       ) {
-        this._comicChapterPageCounts = chapterPageCounts;
+        this._mergeComicMetadataCache(
+          id,
+          chapterBookIds,
+          chapterPageCounts,
+          pageCountApiBase,
+          pageCountAuthGeneration,
+        );
       }
 
       return {
@@ -2817,9 +3057,9 @@ class LightNovelShelf extends ComicSource {
         throw new Error(`无效章节 ID: ${epId}`);
       }
 
-      let total = this._knownComicPageCount(chapterId);
+      let total = this._knownComicPageCount(comicId, chapterId);
       if (total === null) {
-        total = (await this._loadComicContentBatch(chapterId, 0)).total;
+        total = (await this._loadComicContentBatch(comicId, chapterId, 0)).total;
       }
       if (total === 0) {
         throw new Error("该章节未返回任何图片");
@@ -2885,13 +3125,14 @@ class LightNovelShelf extends ComicSource {
           );
 
           if (targetId !== null) {
+            comment.replyToId = String(targetId);
             const targetName = this._replyTargetUserName(
               parts.commentaries,
               parts.users,
               targetId,
             );
             if (targetName) {
-              comment.content = `回复 @${targetName}：${comment.content}`;
+              comment.replyToUserName = targetName;
             }
           }
 
@@ -2968,6 +3209,54 @@ class LightNovelShelf extends ComicSource {
       return "ok";
     },
 
+    replyComment: async (comicId, subId, content, parentId, replyId) => {
+      if (!this.isLogged) {
+        throw new Error("请先登录轻书架账号");
+      }
+      const text = String(content == null ? "" : content);
+      if (!text.trim()) {
+        throw new Error("评论内容不能为空");
+      }
+      const parent = this._parseCommentReference(parentId);
+      const params = {
+        Type: "Series",
+        Id: 0,
+        SeriesTitle: String(comicId),
+        Content: text,
+        ParentId: parent.id,
+      };
+      if (replyId) {
+        const targetId = this._positiveCommentInteger(replyId);
+        if (targetId === null) throw new Error("无效回复评论 ID");
+        params.ReplyId = targetId;
+      }
+      await this._hubCall("ReplyComment", params, { retryTransport: false });
+      return "ok";
+    },
+
+    updateReadProgress: async (comicId, epId, page) => {
+      if (!this.isLogged) return "ok";
+      const chapterId = this._comicChapterId(epId);
+      if (chapterId === null) throw new Error("无效轻书架章节 ID");
+      const pageNumber = Number(page);
+      if (!Number.isSafeInteger(pageNumber) || pageNumber < 1) {
+        throw new Error("无效轻书架阅读页码");
+      }
+      const bookId = this._comicChapterBookIds.get(
+        this._comicChapterBookIdKey(comicId, chapterId),
+      );
+      if (!Number.isSafeInteger(bookId) || bookId <= 0) return "ok";
+      const fingerprint = `${String(comicId)}:${bookId}:${chapterId}:${pageNumber}`;
+      if (this._lastSubmittedReadProgress === fingerprint) return "ok";
+      await this._hubCall(
+        "SaveReadPosition",
+        { Bid: bookId, Cid: chapterId, XPath: String(pageNumber) },
+        { retryTransport: false },
+      );
+      this._lastSubmittedReadProgress = fingerprint;
+      return "ok";
+    },
+
     onImageLoad: async (url, comicId, epId) => {
       const headers = {
         "User-Agent": this.userAgent,
@@ -2983,7 +3272,7 @@ class LightNovelShelf extends ComicSource {
         throw new Error("轻书架章节图片键与当前章节不匹配");
       }
 
-      const state = this._getComicContentState(chapterId);
+      const state = this._getComicContentState(comicId, chapterId);
       if (state.total !== null && reference.page >= state.total) {
         throw new Error("轻书架章节图片页码越界");
       }
@@ -2991,7 +3280,7 @@ class LightNovelShelf extends ComicSource {
       const skip =
         Math.floor(reference.page / LightNovelShelf.comicContentPageSize) *
         LightNovelShelf.comicContentPageSize;
-      const batch = await this._loadComicContentBatch(chapterId, skip);
+      const batch = await this._loadComicContentBatch(comicId, chapterId, skip);
       if (reference.page >= batch.total) {
         throw new Error("轻书架章节图片页码越界");
       }
