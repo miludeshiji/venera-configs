@@ -38,6 +38,7 @@ class LightNovelShelf extends ComicSource {
     "请输入 RefreshToken 和 x-id，并用 ， , ； ; 或 | 分隔";
 
   name = "轻书架";
+  key = "LightNovelShelf";
   version = "0.3.1";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
