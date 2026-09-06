@@ -17,10 +17,11 @@ const vm = require("node:vm");
 const crypto = require("node:crypto");
 const zlib = require("node:zlib");
 
-// 1. 解析 RefreshToken 与 x-id
+// 1. 解析 RefreshToken, x-id 与可选 legacy 漫画标题
 function parseCredentials() {
   let token = process.env.LIGHTNOVELSHELF_REFRESH_TOKEN || process.env.REFRESH_TOKEN || "";
   let xId = process.env.LIGHTNOVELSHELF_X_ID || process.env.X_ID || "";
+  let legacyTitle = process.env.LIGHTNOVELSHELF_LEGACY_TITLE || "寄宿学校的朱丽叶";
 
   const args = process.argv.slice(2);
   for (let i = 0; i < args.length; i++) {
@@ -29,10 +30,14 @@ function parseCredentials() {
       token = args[++i] || "";
     } else if (arg === "--x-id" || arg === "-x") {
       xId = args[++i] || "";
+    } else if (arg === "--legacy-title" || arg === "--title" || arg === "-t") {
+      legacyTitle = args[++i] || legacyTitle;
     } else if (!token && !arg.startsWith("-")) {
       token = arg;
     } else if (!xId && !arg.startsWith("-")) {
       xId = arg;
+    } else if (!arg.startsWith("-")) {
+      legacyTitle = arg;
     }
   }
 
@@ -50,11 +55,12 @@ function parseCredentials() {
 
   token = String(token || "").trim();
   xId = String(xId || "").trim();
+  legacyTitle = String(legacyTitle || "寄宿学校的朱丽叶").trim();
 
-  return { token, xId };
+  return { token, xId, legacyTitle };
 }
 
-const { token: refreshToken, xId: visitorId } = parseCredentials();
+const { token: refreshToken, xId: visitorId, legacyTitle } = parseCredentials();
 
 if (!refreshToken || !visitorId) {
   console.error("==================================================");
@@ -377,41 +383,235 @@ async function runSmoke() {
 
   try {
     // 1. 测试 Token 刷新
-    console.log("\n[1/8] 验证 refresh 接口...");
+    console.log("\n[1/9] 验证 refresh 接口...");
     const sessionToken = await source._ensureSessionToken(true);
     if (!sessionToken || typeof sessionToken !== "string") {
       throw new Error("refresh 响应未获取到有效 SessionToken");
     }
     console.log(`  ✓ refresh 成功, SessionToken 长度: ${sessionToken.length}`);
 
-    // 2. 测试 latest / view 列表
-    console.log("\n[2/8] 验证 GetComicList (latest & view)...");
-    const [latest, view] = await Promise.all([
-      source._loadComicList("latest", 1, 6),
-      source._loadComicList("view", 1, 6),
+    // 2. 测试 latest / view 列表与 book:<Id> 卡片格式
+    console.log("\n[2/9] 验证 GetComicList (latest & view) 原始项与 book:<Id> 卡片身份...");
+    const [rawLatestResp, rawViewResp] = await Promise.all([
+      source._hubCall(
+        "GetComicList",
+        { Page: 1, Size: 6, Order: "latest" },
+        { retryTransport: true },
+      ),
+      source._hubCall(
+        "GetComicList",
+        { Page: 1, Size: 6, Order: "view" },
+        { retryTransport: true },
+      ),
     ]);
+    const rawLatestList = source._value(rawLatestResp, "data", "Data", []);
+    if (!Array.isArray(rawLatestList) || rawLatestList.length === 0) {
+      throw new Error("GetComicList latest 原始列表为空");
+    }
+    const rawFirstItem = rawLatestList[0];
+    const rawFirstId = Number(source._value(rawFirstItem, "id", "Id", NaN));
+    if (!Number.isSafeInteger(rawFirstId) || rawFirstId <= 0) {
+      throw new Error(`GetComicList 返回了无效代表 Book.Id: ${rawFirstId}`);
+    }
+    const rawFirstTitle = String(
+      source._value(rawFirstItem, "title", "Title", "") || "",
+    ).trim();
+    const expectedDirectId = `book:${rawFirstId}`;
+
+    const latest = source._comicListFromResponse(rawLatestResp);
+    const view = source._comicListFromResponse(rawViewResp);
     if (!latest.comics || latest.comics.length === 0) {
-      throw new Error("latest 列表为空");
+      throw new Error("latest 转换后列表为空");
     }
     if (!view.comics || view.comics.length === 0) {
-      throw new Error("view 列表为空");
+      throw new Error("view 转换后列表为空");
     }
-    console.log(`  ✓ latest 漫画数量: ${latest.comics.length}, 样例: “${latest.comics[0].title}”`);
-    console.log(`  ✓ view 漫画数量: ${view.comics.length}, 样例: “${view.comics[0].title}”`);
-
-    const targetComic = latest.comics[0];
-    const targetTitle = targetComic.title;
-    const targetKey = source._seriesCacheKey(targetTitle);
-    const targetListMeta = source._seriesListMetadata.get(targetKey);
-    const originalListId = targetListMeta
-      ? targetListMeta.representativeBookId
-      : null;
+    if (latest.comics[0].id !== expectedDirectId) {
+      throw new Error(
+        `列表卡片 ID 格式异常: 实际 ${latest.comics[0].id}, 期望 ${expectedDirectId}`,
+      );
+    }
     console.log(
-      `  ✓ 选定目标漫画: “${targetTitle}” (原始列表 representativeBookId: ${originalListId || "未知"})`,
+      `  ✓ latest 漫画数量: ${latest.comics.length}, 样例: “${latest.comics[0].title}” (卡片 ID: ${latest.comics[0].id})`,
+    );
+    console.log(
+      `  ✓ view 漫画数量: ${view.comics.length}, 样例: “${view.comics[0].title}” (卡片 ID: ${view.comics[0].id})`,
     );
 
-    // 3. 测试 exact 搜索解析（直接调用 SearchComicSeries Mode=exact 并严格核验，不得通过 resolver 假验证）
-    console.log(`\n[3/8] 验证 SearchComicSeries (exact: “${targetTitle}”)...`);
+    // 3. direct ID 冷启动加载（清空标题映射后用 book:<Id> 加载，断言坚决不发起搜索）
+    console.log(
+      `\n[3/9] 验证 direct ID (${expectedDirectId}) 冷启动加载（断言坚决不发起搜索）...`,
+    );
+    source._deleteSeriesBookMapping(rawFirstTitle, rawFirstId);
+    source._clearComicContentStates();
+
+    let searchCalledDuringDirect = false;
+    const originalHubCall = source._hubCall.bind(source);
+    source._hubCall = async (target, params, options) => {
+      if (target === "SearchComicSeries") {
+        searchCalledDuringDirect = true;
+        throw new Error(
+          `direct ID 路径坚决禁止调用 SearchComicSeries: ${JSON.stringify(params)}`,
+        );
+      }
+      return await originalHubCall(target, params, options);
+    };
+
+    let directDetails;
+    try {
+      directDetails = await source.comic.loadInfo(expectedDirectId);
+    } finally {
+      source._hubCall = originalHubCall;
+    }
+    if (searchCalledDuringDirect) {
+      throw new Error("direct ID 加载违规触发了 SearchComicSeries 搜索");
+    }
+    if (!directDetails || !directDetails.title) {
+      throw new Error("direct ID loadInfo 未返回有效漫画详情");
+    }
+    console.log(
+      `  ✓ direct ID 加载成功: 标题 “${directDetails.title}”, subId: ${directDetails.subId}, 断言通过: 0 次搜索`,
+    );
+
+    // 4. legacy 标题安全恢复与有界搜索只读诊断（清空 legacy 缓存后诊断并验证复用）
+    console.log(
+      `\n[4/9] 验证 legacy 标题安全恢复与有界搜索诊断 (目标: “${legacyTitle}”)...`,
+    );
+    source._deleteSeriesBookMapping(legacyTitle);
+    source._seriesRepresentativeBookIds.clear();
+    source._seriesRepresentativeBookIdSources.clear();
+    source._seriesNegativeCache.clear();
+    source._seriesLoadPromises.clear();
+
+    console.log("  [只读安全诊断]");
+    console.log("    - 内存/持久缓存: 已清空冷启动");
+
+    try {
+      const hData = await source._hubCall(
+        "GetReadHistory",
+        {},
+        { retryTransport: true },
+      );
+      const hIds = source._historyIdsFromResponse(hData);
+      console.log(`    - 官方历史记录数: ${hIds.length} 本`);
+      if (hIds.length > 0) {
+        const chunk = hIds.slice(0, 24);
+        const chunkData = await source._hubCall(
+          "GetBookListByIds",
+          { Ids: chunk, Type: "Comic" },
+          { retryTransport: true },
+        );
+        const chunkItems = source._value(chunkData, "data", "Data", []);
+        const matchInHist = (Array.isArray(chunkItems) ? chunkItems : []).find(
+          (item) =>
+            String(source._value(item, "title", "Title", "") || "").trim() ===
+            legacyTitle,
+        );
+        console.log(
+          `    - 官方历史前 24 本比对: ${matchInHist ? `命中候选 Book.Id=${source._value(matchInHist, "id", "Id", "")}` : "未在首批命中"}`,
+        );
+      }
+    } catch (hErr) {
+      console.log(`    - 官方历史诊断跳过: ${hErr.message}`);
+    }
+
+    for (const mode of ["title", "exact", "name", "fuzzy"]) {
+      try {
+        const sData = await source._hubCall(
+          "SearchComicSeries",
+          {
+            KeyWords: legacyTitle,
+            Mode: mode,
+            Page: 1,
+            Size: 10,
+            IgnoreJapanese: false,
+            IgnoreAI: false,
+          },
+          { retryTransport: true },
+        );
+        const sItems = source._value(sData, "data", "Data", []);
+        const sPages =
+          Number(source._value(sData, "totalPages", "TotalPages", 1)) || 1;
+        const sMatch = (Array.isArray(sItems) ? sItems : []).find(
+          (item) =>
+            String(source._value(item, "title", "Title", "") || "").trim() ===
+            legacyTitle,
+        );
+        console.log(
+          `    - 模式 [${mode}]: 返回 ${Array.isArray(sItems) ? sItems.length : 0} 条, 总页数 ${sPages}, 严格匹配: ${sMatch ? `命中 Book.Id=${source._value(sMatch, "id", "Id", "")}` : "未命中"}`,
+        );
+      } catch (sErr) {
+        console.log(`    - 模式 [${mode}] 探测异常: ${sErr.message}`);
+      }
+    }
+
+    let legacyResolved = null;
+    let legacyErr = null;
+    try {
+      legacyResolved = await source._resolveRepresentativeBookId(legacyTitle, {
+        detailed: true,
+      });
+      console.log(
+        `  ✓ legacy 标题成功恢复: Book.Id=${legacyResolved.id}, 来源: ${legacyResolved.source}`,
+      );
+    } catch (err) {
+      legacyErr = err;
+      console.log(`  ℹ legacy 标题有界检索结果: ${err.message}`);
+    }
+
+    // 验证重复调用复用结果（断言二次调用复用结果，不发起网络搜索）
+    let repeatSearchCount = 0;
+    const trackingHubCall = source._hubCall.bind(source);
+    source._hubCall = async (target, params, options) => {
+      if (target === "SearchComicSeries" || target === "GetReadHistory") {
+        repeatSearchCount += 1;
+      }
+      return await trackingHubCall(target, params, options);
+    };
+    try {
+      if (legacyResolved) {
+        const repeatRes = await source._resolveRepresentativeBookId(legacyTitle, {
+          detailed: true,
+        });
+        if (repeatRes.id !== legacyResolved.id) {
+          throw new Error(
+            `重复调用结果不一致: ${repeatRes.id} vs ${legacyResolved.id}`,
+          );
+        }
+        if (repeatSearchCount > 0) {
+          throw new Error(
+            `重复调用违规发起 ${repeatSearchCount} 次网络检索，未复用已恢复映射`,
+          );
+        }
+        console.log(
+          `  ✓ 二次调用成功复用结果 (Book.Id: ${repeatRes.id})，网络检索增量: 0 次`,
+        );
+      } else if (legacyErr) {
+        let secondErr = null;
+        try {
+          await source._resolveRepresentativeBookId(legacyTitle, {
+            detailed: true,
+          });
+        } catch (e) {
+          secondErr = e;
+        }
+        if (!secondErr) {
+          throw new Error("预期二次调用命中负缓存并抛出相同错误");
+        }
+        if (repeatSearchCount > 0) {
+          throw new Error(
+            `重复调用违规发起 ${repeatSearchCount} 次网络检索，负缓存未生效`,
+          );
+        }
+        console.log(`  ✓ 二次调用成功命中负缓存，网络检索增量: 0 次`);
+      }
+    } finally {
+      source._hubCall = trackingHubCall;
+    }
+
+    // 5. 测试 exact 搜索解析（使用前面 latest 样本标题，保证真实有效）
+    const targetTitle = rawFirstTitle;
+    console.log(`\n[5/9] 验证 SearchComicSeries (exact: “${targetTitle}”)...`);
     const searchResult = await source._hubCall(
       "SearchComicSeries",
       {
@@ -419,8 +619,8 @@ async function runSmoke() {
         Mode: "exact",
         Page: 1,
         Size: 20,
-        IgnoreJapanese: !!source.loadSetting("ignoreJapanese"),
-        IgnoreAI: !!source.loadSetting("ignoreAI"),
+        IgnoreJapanese: false,
+        IgnoreAI: false,
       },
       { retryTransport: true },
     );
@@ -442,10 +642,12 @@ async function runSmoke() {
       );
     }
     const resolvedBookId = exactBookId;
-    console.log(`  ✓ SearchComicSeries Mode=exact 成功, 返回 Book.Id: ${resolvedBookId}`);
+    console.log(
+      `  ✓ SearchComicSeries Mode=exact 成功, 返回 Book.Id: ${resolvedBookId}`,
+    );
 
-    // 4. 测试 GetBookInfo（只读获取原始响应形态并安全诊断，再通过 comic.loadInfo 校验完整详情）
-    console.log(`\n[4/8] 验证 GetBookInfo (BookId: ${resolvedBookId})...`);
+    // 6. 测试 GetBookInfo（只读获取原始响应形态并安全诊断，再通过 comic.loadInfo 校验完整详情）
+    console.log(`\n[6/9] 验证 GetBookInfo (BookId: ${resolvedBookId})...`);
     const rawBookInfo = await source._hubCall(
       "GetBookInfo",
       { Id: resolvedBookId },
@@ -521,26 +723,41 @@ async function runSmoke() {
     console.log(
       `  ✓ 选定章节 [${sampleChapterIdStr}] “${sampleChapterTitle}” 用于后续只读测试`,
     );
-    // 5. 测试 GetComicContent (只读第 1 批，验证 Chapter.Id 与 BookId 回填)
-    console.log(`\n[5/8] 验证 GetComicContent (Cid: ${sampleChapterId})...`);
-    const contentBatch = await source._loadComicContentBatch(targetTitle, sampleChapterId, 0);
-    if (!contentBatch || !Array.isArray(contentBatch.images) || contentBatch.images.length === 0) {
+
+    // 7. 测试 GetComicContent (只读第 1 批，验证 Chapter.Id 与 BookId 回填)
+    console.log(`\n[7/9] 验证 GetComicContent (Cid: ${sampleChapterId})...`);
+    const contentBatch = await source._loadComicContentBatch(
+      targetTitle,
+      sampleChapterId,
+      0,
+    );
+    if (
+      !contentBatch ||
+      !Array.isArray(contentBatch.images) ||
+      contentBatch.images.length === 0
+    ) {
       throw new Error("GetComicContent 未返回图片列表");
     }
     const backfilledBookId = source._comicChapterBookIds.get(
       source._comicChapterBookIdKey(targetTitle, sampleChapterId),
     );
-    console.log(`  ✓ GetComicContent 成功, 总页数: ${contentBatch.total}, 本批页数: ${contentBatch.images.length}`);
-    console.log(`  ✓ Chapter.BookId 回填检查: ${backfilledBookId ? `已回填 (BookId: ${backfilledBookId})` : "未回填 (章节无单独 BookId)"}`);
+    console.log(
+      `  ✓ GetComicContent 成功, 总页数: ${contentBatch.total}, 本批页数: ${contentBatch.images.length}`,
+    );
+    console.log(
+      `  ✓ Chapter.BookId 回填检查: ${backfilledBookId ? `已回填 (BookId: ${backfilledBookId})` : "未回填 (章节无单独 BookId)"}`,
+    );
 
-    // 6. 测试 GetReadHistory
-    console.log("\n[6/8] 验证 GetReadHistory (只读拉取)...");
-    const historyData = await source._hubCall("GetReadHistory", {}, { retryTransport: true });
+    // 8. 测试 GetReadHistory & GetBookListByIds
+    console.log("\n[8/9] 验证 GetReadHistory & GetBookListByIds (只读拉取)...");
+    const historyData = await source._hubCall(
+      "GetReadHistory",
+      {},
+      { retryTransport: true },
+    );
     const historyIds = source._historyIdsFromResponse(historyData);
     console.log(`  ✓ GetReadHistory 成功, 历史记录 ID 数: ${historyIds.length}`);
 
-    // 7. 测试 GetBookListByIds (Type=Comic)
-    console.log(`\n[7/8] 验证 GetBookListByIds (Type: Comic, Id: ${resolvedBookId})...`);
     const bookListData = await source._hubCall(
       "GetBookListByIds",
       { Ids: [resolvedBookId], Type: "Comic" },
@@ -552,13 +769,20 @@ async function runSmoke() {
     }
     console.log(`  ✓ GetBookListByIds 成功, 返回条目数: ${bookList.length}`);
 
-    // 8. 测试 GetComments (Type=Book)
-    console.log(`\n[8/8] 验证 GetComments (Type: Book, Id: ${resolvedBookId})...`);
-    const commentsResult = await source.comic.loadComments(targetTitle, String(resolvedBookId), 1, null);
-    console.log(`  ✓ GetComments 成功, 评论数: ${commentsResult.comments.length}, 最大页: ${commentsResult.maxPage}`);
+    // 9. 测试 GetComments (Type=Book)
+    console.log(`\n[9/9] 验证 GetComments (Type: Book, Id: ${resolvedBookId})...`);
+    const commentsResult = await source.comic.loadComments(
+      targetTitle,
+      String(resolvedBookId),
+      1,
+      null,
+    );
+    console.log(
+      `  ✓ GetComments 成功, 评论数: ${commentsResult.comments.length}, 最大页: ${commentsResult.maxPage}`,
+    );
 
     console.log("\n==================================================");
-    console.log("【全部 8 项真实只读 Smoke 验证通过！】");
+    console.log("【全部 9 项真实只读 Smoke 验证通过！】");
     console.log("==================================================");
   } finally {
     await source._disconnectHub("Smoke test completed");

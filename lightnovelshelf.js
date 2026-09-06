@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.3.4
+ * 版本：0.3.5
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -14,7 +14,7 @@
  * - 9 次/5.5 秒请求调度器 / Gzip 响应解码
  * - 漫画阅读进度单向同步（Venera → 轻书架）
  * - 新版 GetBookInfo 漫画详情（兼容 nested/root-level Book 契约与安全诊断） / 多上传版本章节聚合 / Book 评论与楼中楼回复
- * - SeriesTitle->Book.Id 持久映射 / 坏映射精准清理与 exact->fuzzy 严格恢复 / direct ID 直连跳过搜索
+ * - 稳定 book:<id> 漫画身份模型 / 旧 SeriesTitle 通过官方历史与有界搜索安全恢复 / direct ID 直连跳过搜索
  * - 发现页多区块容错独立 settle / 正文 BookId 回填与阅读进度同步
  * - BookInfo TTL (60s) 缓存与容量淘汰 (64)
  * 使用前：
@@ -32,6 +32,9 @@ class LightNovelShelf extends ComicSource {
   static bookInfoCacheLimit = 64;
   static bookInfoCacheTtlMs = 60 * 1000;
   static seriesBookMapLimit = 256;
+  static seriesNegativeCacheTtlMs = 30 * 1000;
+  static legacySearchMaxPagesPerMode = 3;
+  static legacyHistoryChunkSize = 24;
   static hubPingIntervalMs = 15000;
   static hubInvocationTimeoutMs = 30000;
   static hubConnectTimeoutMs = 30000;
@@ -46,7 +49,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.3.4";
+  version = "0.3.5";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -110,10 +113,11 @@ class LightNovelShelf extends ComicSource {
   _comicMetadataKeys = new Map();
   _lastSubmittedReadProgress = "";
   _comicContentUseSequence = 0;
-  // 新版漫画详情以 Book.Id 查询；对外 comicId 仍保持 SeriesTitle。
+  // 稳定 book:<id> 漫画身份模型；对旧 SeriesTitle 提供安全恢复。
   _seriesRepresentativeBookIds = new Map();
   _seriesRepresentativeBookIdSources = new Map();
   _seriesListMetadata = new Map();
+  _seriesNegativeCache = new Map();
   _bookInfoCache = new Map();
   _bookInfoPromises = new Map();
   _seriesLoadPromises = new Map();
@@ -2080,6 +2084,7 @@ class LightNovelShelf extends ComicSource {
     this._seriesRepresentativeBookIds.clear();
     this._seriesRepresentativeBookIdSources.clear();
     this._seriesListMetadata.clear();
+    this._seriesNegativeCache.clear();
     this._bookInfoCache.clear();
     this._bookInfoPromises.clear();
     this._seriesLoadPromises.clear();
@@ -2519,6 +2524,12 @@ class LightNovelShelf extends ComicSource {
       }
     }
 
+    for (const key of Array.from(this._seriesNegativeCache.keys())) {
+      if (key.startsWith(`${apiBase}\n`) && key.endsWith(`\n${title}`)) {
+        this._seriesNegativeCache.delete(key);
+      }
+    }
+
     for (const key of Array.from(this._seriesLoadPromises.keys())) {
       if (
         key.startsWith(`${apiBase}\n`) &&
@@ -2586,10 +2597,14 @@ class LightNovelShelf extends ComicSource {
     source = "memory",
   ) {
     const title = String(this._value(item, "title", "Title", "") || "").trim();
-    if (!title) return;
-    const representativeBookId = Number(
-      this._value(item, "id", "Id", NaN),
-    );
+    const rawId = this._value(item, "id", "Id", NaN);
+    const representativeBookId = Number(rawId);
+    if (
+      !title &&
+      (!Number.isSafeInteger(representativeBookId) || representativeBookId <= 0)
+    ) {
+      return;
+    }
     const metadata = {
       title: title,
       originalTitle: String(
@@ -2601,17 +2616,285 @@ class LightNovelShelf extends ComicSource {
         this._value(item, "lastUpdatedAt", "LastUpdatedAt", null),
       representativeBookId: representativeBookId,
     };
-    this._seriesListMetadata.set(
-      this._seriesCacheKey(title, apiBase, authGeneration),
-      metadata,
+    if (title) {
+      this._seriesListMetadata.set(
+        this._seriesCacheKey(title, apiBase, authGeneration),
+        metadata,
+      );
+      if (Number.isSafeInteger(representativeBookId) && representativeBookId > 0) {
+        this._rememberRepresentativeBookId(
+          title,
+          representativeBookId,
+          apiBase,
+          authGeneration,
+          source,
+        );
+      }
+    }
+    if (Number.isSafeInteger(representativeBookId) && representativeBookId > 0) {
+      this._seriesListMetadata.set(
+        this._seriesCacheKey(
+          `book:${representativeBookId}`,
+          apiBase,
+          authGeneration,
+        ),
+        metadata,
+      );
+      this._seriesListMetadata.set(
+        this._seriesCacheKey(
+          representativeBookId,
+          apiBase,
+          authGeneration,
+        ),
+        metadata,
+      );
+    }
+  }
+
+  async _verifyCandidate(candidateBookId, expectedTitle) {
+    const bookId = Number(candidateBookId);
+    if (!Number.isSafeInteger(bookId) || bookId <= 0) return null;
+    const normalizedExpectedTitle = String(
+      expectedTitle == null ? "" : expectedTitle,
+    ).trim();
+    if (!normalizedExpectedTitle) return null;
+
+    try {
+      const info = await this._getBookInfo(bookId, "verify");
+      const bookObj = this._value(info, "book", "Book", info);
+      const type = String(this._value(bookObj, "type", "Type", ""));
+      const resolvedSeriesTitle = String(
+        this._value(info, "seriesTitle", "SeriesTitle", "") || "",
+      ).trim();
+      const verifiedBookId = Number(this._value(bookObj, "id", "Id", NaN));
+
+      if (
+        verifiedBookId === bookId &&
+        type === "Comic" &&
+        resolvedSeriesTitle === normalizedExpectedTitle
+      ) {
+        return { bookId: bookId, info: info };
+      }
+    } catch (err) {
+      if (this._isOperationalError(err)) {
+        throw err;
+      }
+      // 非运行故障（如 404、类型不符、契约错误、标题不匹配）判定为无效候选
+    }
+    return null;
+  }
+
+  async _resolveFromHistory(title, apiBase, authGeneration) {
+    const historyData = await this._hubCall(
+      "GetReadHistory",
+      {},
+      { retryTransport: true },
     );
-    this._rememberRepresentativeBookId(
-      title,
-      representativeBookId,
-      apiBase,
-      authGeneration,
-      source,
-    );
+    const historyIds = this._historyIdsFromResponse(historyData);
+    if (!Array.isArray(historyIds) || historyIds.length === 0) {
+      return null;
+    }
+
+    const chunkSize = this.constructor.legacyHistoryChunkSize || 24;
+    for (let i = 0; i < historyIds.length; i += chunkSize) {
+      const chunk = historyIds.slice(i, i + chunkSize);
+      if (chunk.length === 0) continue;
+
+      const data = await this._hubCall(
+        "GetBookListByIds",
+        {
+          Ids: chunk,
+          Type: "Comic",
+        },
+        { retryTransport: true },
+      );
+      const items = this._value(data, "data", "Data", []);
+      for (const item of Array.isArray(items) ? items : []) {
+        const itemTitle = String(
+          this._value(item, "title", "Title", "") || "",
+        ).trim();
+        if (itemTitle === title) {
+          const candidateId = Number(this._value(item, "id", "Id", NaN));
+          if (Number.isSafeInteger(candidateId) && candidateId > 0) {
+            const verified = await this._verifyCandidate(candidateId, title);
+            if (verified) {
+              return {
+                bookId: candidateId,
+                item: item,
+                info: verified.info,
+              };
+            }
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  async _resolveFromSearch(title, apiBase, authGeneration) {
+    const modes = ["title", "exact", "name", "fuzzy"];
+    const maxPages = this.constructor.legacySearchMaxPagesPerMode || 3;
+
+    for (const mode of modes) {
+      let page = 1;
+      let totalPages = 1;
+
+      while (page <= Math.min(totalPages, maxPages)) {
+        const data = await this._hubCall(
+          "SearchComicSeries",
+          {
+            KeyWords: title,
+            Mode: mode,
+            Page: page,
+            Size: 20,
+            IgnoreJapanese: false, // 强制不过滤
+            IgnoreAI: false,       // 强制不过滤
+          },
+          { retryTransport: true },
+        );
+
+        const rawTotalPages = Number(
+          this._value(data, "totalPages", "TotalPages", 1),
+        );
+        totalPages =
+          Number.isSafeInteger(rawTotalPages) && rawTotalPages > 0
+            ? rawTotalPages
+            : 1;
+
+        const items = this._value(data, "data", "Data", []);
+        for (const item of Array.isArray(items) ? items : []) {
+          const itemTitle = String(
+            this._value(item, "title", "Title", "") || "",
+          ).trim();
+          if (itemTitle === title) {
+            const candidateId = Number(this._value(item, "id", "Id", NaN));
+            if (Number.isSafeInteger(candidateId) && candidateId > 0) {
+              const verified = await this._verifyCandidate(candidateId, title);
+              if (verified) {
+                return {
+                  bookId: candidateId,
+                  item: item,
+                  mode: mode,
+                  info: verified.info,
+                };
+              }
+            }
+          }
+        }
+
+        page += 1;
+      }
+    }
+    return null;
+  }
+
+  async _resolveRepresentativeBookIdInternal(title, key, apiBase, authGen) {
+    // 1. 内存缓存快速恢复（当前会话已建立或已核验的代表 ID，零额外网络开销）
+    const memoryId = this._seriesRepresentativeBookIds.get(key);
+    if (Number.isSafeInteger(memoryId) && memoryId > 0) {
+      return memoryId;
+    }
+
+    // 2. 持久映射恢复并严格校验
+    let badPersistentId = null;
+    const persistentId = this._getPersistentSeriesBookId(title, apiBase);
+    if (Number.isSafeInteger(persistentId) && persistentId > 0) {
+      const verified = await this._verifyCandidate(persistentId, title);
+      if (verified) {
+        this._rememberRepresentativeBookId(
+          title,
+          persistentId,
+          apiBase,
+          authGen,
+          "persistent",
+        );
+        return persistentId;
+      }
+      // 坏持久映射先保留，只有新候选验证成功后才原子替换
+      badPersistentId = persistentId;
+    }
+
+    // 3. 官方阅读历史主动拉取恢复
+    try {
+      const historyResult = await this._resolveFromHistory(
+        title,
+        apiBase,
+        authGen,
+      );
+      if (historyResult) {
+        const newBookId = historyResult.bookId;
+        this._rememberSeriesListMetadata(
+          historyResult.item,
+          apiBase,
+          authGen,
+          "history",
+        );
+        this._setPersistentSeriesBookId(title, newBookId, apiBase);
+        this._rememberRepresentativeBookId(
+          title,
+          newBookId,
+          apiBase,
+          authGen,
+          "history",
+        );
+        return newBookId;
+      }
+    } catch (err) {
+      if (this._isOperationalError(err)) {
+        throw err;
+      }
+    }
+
+    // 4. 有界检索恢复：title -> exact -> name -> fuzzy
+    try {
+      const searchResult = await this._resolveFromSearch(
+        title,
+        apiBase,
+        authGen,
+      );
+      if (searchResult) {
+        const newBookId = searchResult.bookId;
+        this._rememberSeriesListMetadata(
+          searchResult.item,
+          apiBase,
+          authGen,
+          searchResult.mode,
+        );
+        this._setPersistentSeriesBookId(title, newBookId, apiBase);
+        this._rememberRepresentativeBookId(
+          title,
+          newBookId,
+          apiBase,
+          authGen,
+          searchResult.mode,
+        );
+        return newBookId;
+      }
+    } catch (err) {
+      if (this._isOperationalError(err)) {
+        throw err;
+      }
+    }
+
+    // 5. 确定性无结果：坏持久映射继续保留，建立短时负缓存并抛出可操作诊断
+    const diagMsg =
+      badPersistentId !== null
+        ? `无法解析漫画“${title}”对应的 Book.Id（已保留旧持久映射 ${badPersistentId}，但其 GetBookInfo 校验未通过，且官方历史与有界搜索未发现严格匹配漫画）`
+        : `无法解析漫画“${title}”对应的 Book.Id（官方历史与有界搜索未发现严格匹配漫画）`;
+    const notFoundError = new Error(diagMsg);
+    notFoundError.code = "LIGHTNOVELSHELF_COMIC_NOT_FOUND";
+    notFoundError.isDeterministicNotFound = true;
+    notFoundError.title = title;
+    if (badPersistentId !== null) {
+      notFoundError.retainedPersistentId = badPersistentId;
+    }
+
+    this._seriesNegativeCache.set(key, {
+      timestamp: Date.now(),
+      error: notFoundError,
+    });
+
+    throw notFoundError;
   }
 
   async _resolveRepresentativeBookId(seriesTitle, options = {}) {
@@ -2630,42 +2913,40 @@ class LightNovelShelf extends ComicSource {
     const apiBase = this.apiBase;
     const authGen = this._authGeneration;
     const key = this._seriesCacheKey(title, apiBase, authGen);
-    const cached = this._seriesRepresentativeBookIds.get(key);
-    if (Number.isSafeInteger(cached) && cached > 0) {
-      const source =
-        this._seriesRepresentativeBookIdSources.get(key) || "memory";
-      if (detailed) {
-        return { id: cached, bookId: cached, source: source };
+
+    // 负缓存拦截，防止连续重复请求
+    const neg = this._seriesNegativeCache.get(key);
+    if (neg) {
+      const age = Date.now() - neg.timestamp;
+      if (
+        Number.isFinite(age) &&
+        age >= 0 &&
+        age < this.constructor.seriesNegativeCacheTtlMs
+      ) {
+        throw neg.error;
       }
-      return cached;
+      this._seriesNegativeCache.delete(key);
     }
-    const persistentId = this._getPersistentSeriesBookId(title, apiBase);
-    if (Number.isSafeInteger(persistentId) && persistentId > 0) {
-      this._rememberRepresentativeBookId(
-        title,
-        persistentId,
-        apiBase,
-        authGen,
-        "persistent",
-      );
-      if (detailed) {
-        return { id: persistentId, bookId: persistentId, source: "persistent" };
-      }
-      return persistentId;
-    }
+
+    // 同标题并发共享 Promise
     const pendingKey = `${key}\nresolve`;
     const pending = this._seriesLoadPromises.get(pendingKey);
     if (pending) {
       const resolved = await pending;
       if (detailed) {
         const source =
-          this._seriesRepresentativeBookIdSources.get(key) || "exact";
+          this._seriesRepresentativeBookIdSources.get(key) || "recovered";
         return { id: resolved, bookId: resolved, source: source };
       }
       return resolved;
     }
 
-    const request = this._resolveRepresentativeBookIdFromSearch(title, key);
+    const request = this._resolveRepresentativeBookIdInternal(
+      title,
+      key,
+      apiBase,
+      authGen,
+    );
     this._seriesLoadPromises.set(pendingKey, request);
     const clear = () => {
       if (this._seriesLoadPromises.get(pendingKey) === request) {
@@ -2673,10 +2954,11 @@ class LightNovelShelf extends ComicSource {
       }
     };
     request.then(clear, clear);
+
     const resolved = await request;
     if (detailed) {
       const source =
-        this._seriesRepresentativeBookIdSources.get(key) || "exact";
+        this._seriesRepresentativeBookIdSources.get(key) || "recovered";
       return { id: resolved, bookId: resolved, source: source };
     }
     return resolved;
@@ -2688,49 +2970,18 @@ class LightNovelShelf extends ComicSource {
     });
   }
 
-  async _resolveRepresentativeBookIdFromSearch(title, key) {
-    const searchInMode = async (mode) => {
-      const data = await this._hubCall(
-        "SearchComicSeries",
-        {
-          KeyWords: title,
-          Mode: mode,
-          Page: 1,
-          Size: 20,
-          IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
-          IgnoreAI: !!this.loadSetting("ignoreAI"),
-        },
-        { retryTransport: true },
-      );
-      const items = this._value(data, "data", "Data", []);
-      return (Array.isArray(items) ? items : []).find(
-        (item) =>
-          String(this._value(item, "title", "Title", "") || "").trim() ===
-          title,
-      );
-    };
-
-    let searchSource = "exact";
-    let match = await searchInMode("exact");
-    if (!match) {
-      searchSource = "fuzzy";
-      match = await searchInMode("fuzzy");
-    }
-    if (!match) {
-      throw new Error(`无法解析漫画“${title}”对应的 Book.Id`);
-    }
-    this._rememberSeriesListMetadata(
-      match,
-      this.apiBase,
-      this._authGeneration,
-      searchSource,
+  _isContractOrMismatchError(err) {
+    if (!err || typeof err !== "object") return false;
+    if (this._isOperationalError(err)) return false;
+    return (
+      err.isContractError === true ||
+      err.isBookInfoContractError === true ||
+      err.isSeriesTitleMismatch === true ||
+      String(err.message || "").includes("GetBookInfo 契约校验失败") ||
+      String(err.message || "").includes("GetBookInfo 未返回 Book") ||
+      String(err.message || "").includes("GetBookInfo 返回了无效的漫画 Book") ||
+      String(err.message || "").includes("GetBookInfo 返回的 SeriesTitle 与请求不一致")
     );
-    const resolved = this._seriesRepresentativeBookIds.get(key);
-    if (!Number.isSafeInteger(resolved) || resolved <= 0) {
-      throw new Error(`漫画“${title}”返回了无效的 Book.Id`);
-    }
-    this._seriesRepresentativeBookIdSources.set(key, searchSource);
-    return resolved;
   }
 
   _bookInfoCacheKey(
@@ -3152,7 +3403,15 @@ class LightNovelShelf extends ComicSource {
   }
 
   _comicFromListItem(item) {
-    const title = this._value(item, "title", "Title", "");
+    const rawId = this._value(item, "id", "Id", null);
+    const bookId = Number(rawId);
+    if (!Number.isSafeInteger(bookId) || bookId <= 0) {
+      throw new Error(`无效漫画代表 Book.Id: ${String(rawId)}`);
+    }
+    const title = String(this._value(item, "title", "Title", "") || "").trim();
+    if (!title) {
+      throw new Error("无效漫画标题");
+    }
     const count = Number(this._value(item, "count", "Count", 0) || 0);
     const original = this._value(item, "originalTitle", "OriginalTitle", "") || "";
     const updated = this._value(item, "lastUpdatedAt", "LastUpdatedAt", "") || "";
@@ -3160,9 +3419,9 @@ class LightNovelShelf extends ComicSource {
     this._rememberSeriesListMetadata(item);
 
     return {
-      // 保持 SeriesTitle 作为 Venera comicId；内部详情和评论使用缓存的 Book.Id。
-      id: String(title),
-      title: String(title),
+      // 新条目永久使用 book:<Book.Id> 作为 Venera comicId；展示标题保持不变
+      id: `book:${bookId}`,
+      title: title,
       subTitle: original || (count ? `${count} 话` : ""),
       cover: this._normalizeUrl(cover),
       tags: [],
@@ -3650,36 +3909,11 @@ class LightNovelShelf extends ComicSource {
       const authGeneration = this._authGeneration;
 
       let representativeBookId;
-      let resolutionSource = "exact";
-
       if (isDirectId) {
         representativeBookId = directBookId;
-        resolutionSource = "direct";
       } else {
-        const resolution = await this._resolveRepresentativeBookId(id, {
-          detailed: true,
-        });
-        representativeBookId = resolution.id;
-        resolutionSource = resolution.source;
+        representativeBookId = await this._resolveRepresentativeBookId(id);
       }
-
-      const isContractOrMismatchError = (err) => {
-        if (!err || typeof err !== "object") return false;
-        if (this._isOperationalError(err)) return false;
-        return (
-          err.isContractError === true ||
-          err.isBookInfoContractError === true ||
-          err.isSeriesTitleMismatch === true ||
-          String(err.message || "").includes("GetBookInfo 契约校验失败") ||
-          String(err.message || "").includes("GetBookInfo 未返回 Book") ||
-          String(err.message || "").includes(
-            "GetBookInfo 返回了无效的漫画 Book",
-          ) ||
-          String(err.message || "").includes(
-            "GetBookInfo 返回的 SeriesTitle 与请求不一致",
-          )
-        );
-      };
 
       let details;
       try {
@@ -3691,48 +3925,46 @@ class LightNovelShelf extends ComicSource {
       } catch (firstErr) {
         const canRecover =
           !isDirectId &&
-          (resolutionSource === "memory" ||
-            resolutionSource === "persistent") &&
-          isContractOrMismatchError(firstErr);
-
+          this._isContractOrMismatchError(firstErr);
         if (!canRecover) {
           throw firstErr;
         }
 
-        const badBookId = representativeBookId;
-        this._deleteSeriesBookMapping(id, badBookId, apiBase);
-
+        // 从内存中清除失效的代表 ID，重新进入完整解析流程（persistent -> history -> search）
         const key = this._seriesCacheKey(id, apiBase, authGeneration);
-        let newBookId;
-        try {
-          newBookId = await this._resolveRepresentativeBookIdFromSearch(
-            id,
-            key,
-          );
-        } catch (searchErr) {
-          throw searchErr;
-        }
+        this._seriesRepresentativeBookIds.delete(key);
+        this._seriesRepresentativeBookIdSources.delete(key);
 
-        if (newBookId === badBookId) {
+        const newBookId = await this._resolveRepresentativeBookId(id);
+        if (newBookId === representativeBookId) {
           throw firstErr;
         }
-
-        try {
-          details = await this._loadSeriesDetails(
-            id,
-            newBookId,
-            false,
-          );
-        } catch (secondErr) {
-          throw secondErr;
-        }
+        details = await this._loadSeriesDetails(
+          id,
+          newBookId,
+          false,
+        );
       }
       const books = Array.isArray(details.books) ? details.books : [];
       const seriesTitle = details.seriesTitle || String(id);
       const targetComicId = String(id);
-      const metadata = this._seriesListMetadata.get(
-        this._seriesCacheKey(seriesTitle, apiBase, authGeneration),
-      );
+      const metadata =
+        this._seriesListMetadata.get(
+          this._seriesCacheKey(id, apiBase, authGeneration),
+        ) ||
+        this._seriesListMetadata.get(
+          this._seriesCacheKey(seriesTitle, apiBase, authGeneration),
+        ) ||
+        this._seriesListMetadata.get(
+          this._seriesCacheKey(
+            `book:${representativeBookId}`,
+            apiBase,
+            authGeneration,
+          ),
+        ) ||
+        this._seriesListMetadata.get(
+          this._seriesCacheKey(representativeBookId, apiBase, authGeneration),
+        );
       const primaryBook =
         books.find(
           (book) =>

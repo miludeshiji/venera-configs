@@ -46,20 +46,23 @@
  * 39. 详情更新时间取列表和 Book 的最新候选值
  * 40. 跨实例通过持久映射恢复 Book.Id 并完全跳过搜索
  * 41. 持久映射损坏安全降级、容量 256 淘汰与 apiBase 线路隔离
- * 42. 漫画标题搜索解析 exact 优先与 fuzzy 严格相等回退
- * 43. fuzzy 搜索结果拒绝相似项且不盲信首项
+ * 42. 漫画标题搜索解析按 title -> exact -> name -> fuzzy 模式顺序有界检索、强制不过滤参数且严格匹配 Title
+ * 43. 搜索结果拒绝相似项且不盲信首项，确定性失败建立短时负缓存
  * 44. book:<正整数> 与纯数字 direct ID 直连跳过搜索且消除一致性冲突
  * 45. 发现页首层多区块独立 settle、局部失败容错与全部失败抛错
  * 46. 正文 GetComicContent 校验 Chapter.Id 并回填 BookId 支持 SaveReadPosition
- * 47. Count 文案在列表与描述中严格规范为“话”
+ * 47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 book:<Id>
  * 48. BookInfo 规范化兼容 nested (data.Book) 与 root (根级对象) 两形态
  * 49. 无效响应（null/string/空对象/Id不匹配/非Comic/Chapters非数组）不缓存并抛出安全诊断且再次请求重新拉取
- * 50. 坏 persistent 映射（契约错误或 SeriesTitle 不一致）清理旧映射并 exact→fuzzy 恢复新 ID，同一坏 ID 绝不循环
+ * 50. 坏 persistent 映射校验失败先保留，候选验证成功后原子替换；全失败保留旧映射绝不循环
  * 51. direct ID 遇到 BookInfo 错误坚决不搜索
  * 52. 网络/认证/超时/限流运行错误坚决不删除 persistent 映射
  * 53. 主次 Book 响应形态混合（主 Book 为 root 形态，次 Book 为 nested 形态且异常时降级）
  * 54. 来源追踪解析与精准删除标题映射方法验证
- * 55. 真实 smoke 所需 direct SearchComicSeries Mode=exact 路径与 safe shape 诊断核验
+ * 55. 真实 smoke 主路径：direct book:<id> 安全形态诊断与 loadInfo 零搜索验证
+ * 56. 新列表/发现/历史/搜索输出全部为 book:<正整数>，严格校验代表 Book.Id
+ * 57. legacy 恢复从官方 GetReadHistory 按 24 本分片串行恢复并严格验证
+ * 58. 确定性无结果建立短时负缓存且同标题并发共享 Promise 单飞，登出/清理重置负缓存
  */
 
 const fs = require("node:fs");
@@ -2229,7 +2232,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.3.4");
+    assert.strictEqual(source.version, "0.3.5");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -2460,20 +2463,21 @@ async function runTests() {
     assert.strictEqual(source._getPersistentSeriesBookId("Comic 260"), 260);
   });
 
-  await test("42. 漫画标题搜索解析 exact 优先与 fuzzy 严格相等回退", async () => {
+  await test("42. 漫画标题搜索解析按 title -> exact -> name -> fuzzy 模式顺序有界检索、强制不过滤参数且严格匹配 Title", async () => {
     const { source } = createSourceHarness();
 
-    // 场景 1: exact 搜索直接命中严格相等的 Title
-    const searchModesCalled = [];
+    // 场景 1: title 搜索直接命中严格相等的 Title，验证参数 IgnoreJapanese=false, IgnoreAI=false
+    const searchCalls = [];
     source._hubCall = async (target, params) => {
       if (target === "SearchComicSeries") {
-        searchModesCalled.push(params.Mode);
-        if (params.Mode === "exact") {
+        searchCalls.push(params);
+        if (params.Mode === "title") {
           return {
             Data: [{ Id: 101, Title: "精确漫画" }],
+            TotalPages: 1,
           };
         }
-        return { Data: [] };
+        return { Data: [], TotalPages: 1 };
       }
       if (target === "GetBookInfo") {
         return {
@@ -2492,22 +2496,24 @@ async function runTests() {
 
     const id1 = await source._resolveRepresentativeBookId("精确漫画");
     assert.strictEqual(id1, 101);
-    assert.deepStrictEqual(searchModesCalled, ["exact"], "exact 命中时不得触发 fuzzy");
+    assert.strictEqual(searchCalls.length, 1);
+    assert.strictEqual(searchCalls[0].Mode, "title", "首个检索模式必须为 title");
+    assert.strictEqual(searchCalls[0].IgnoreJapanese, false, "检索必须强制 IgnoreJapanese: false");
+    assert.strictEqual(searchCalls[0].IgnoreAI, false, "检索必须强制 IgnoreAI: false");
 
-    // 场景 2: exact 搜索未命中，回退至 fuzzy 搜索
+    // 场景 2: title/exact/name 均未命中，最终回退至 fuzzy 搜索
     source._clearComicContentStates();
     const searchModesCalled2 = [];
     source._hubCall = async (target, params) => {
       if (target === "SearchComicSeries") {
         searchModesCalled2.push(params.Mode);
-        if (params.Mode === "exact") {
-          return { Data: [] };
-        }
         if (params.Mode === "fuzzy") {
           return {
             Data: [{ Id: 202, Title: "回退漫画" }],
+            TotalPages: 1,
           };
         }
+        return { Data: [], TotalPages: 1 };
       }
       if (target === "GetBookInfo") {
         return {
@@ -2526,23 +2532,27 @@ async function runTests() {
 
     const id2 = await source._resolveRepresentativeBookId("回退漫画");
     assert.strictEqual(id2, 202);
-    assert.deepStrictEqual(searchModesCalled2, ["exact", "fuzzy"], "exact 失败后应回退 fuzzy");
+    assert.deepStrictEqual(
+      searchModesCalled2,
+      ["title", "exact", "name", "fuzzy"],
+      "搜索模式顺序必须为 title -> exact -> name -> fuzzy",
+    );
   });
 
-  await test("43. fuzzy 搜索结果拒绝相似项且不盲信首项", async () => {
+  await test("43. fuzzy 搜索结果拒绝相似项且不盲信首项，确定性失败建立短时负缓存", async () => {
     const { source } = createSourceHarness();
 
+    let hubCallCount = 0;
     source._hubCall = async (target, params) => {
+      hubCallCount += 1;
       if (target === "SearchComicSeries") {
-        if (params.Mode === "exact") return { Data: [] };
-        if (params.Mode === "fuzzy") {
-          return {
-            Data: [
-              { Id: 999, Title: "目标漫画 (特别篇)" },
-              { Id: 888, Title: "目标漫画 第二季" },
-            ],
-          };
-        }
+        return {
+          Data: [
+            { Id: 999, Title: "目标漫画 (特别篇)" },
+            { Id: 888, Title: "目标漫画 第二季" },
+          ],
+          TotalPages: 1,
+        };
       }
       throw new Error(`Unexpected call: ${target}`);
     };
@@ -2555,6 +2565,17 @@ async function runTests() {
     }
     assert.ok(caughtErr, "找不到严格相等的 Title 时必须抛出错误，严禁直接使用第 1 项");
     assert.match(caughtErr.message, /无法解析漫画“目标漫画”对应的 Book.Id/);
+
+    // 验证短时负缓存拦截后续请求，绝不产生多余网络调用
+    const callsBefore = hubCallCount;
+    let cachedErr = null;
+    try {
+      await source._resolveRepresentativeBookId("目标漫画");
+    } catch (e) {
+      cachedErr = e;
+    }
+    assert.ok(cachedErr);
+    assert.strictEqual(hubCallCount, callsBefore, "负缓存命中期间不得发起新的 Hub 调用");
   });
 
   await test("44. book:<正整数> 与纯数字 direct ID 直连跳过搜索且消除一致性冲突", async () => {
@@ -2736,7 +2757,7 @@ async function runTests() {
     });
   });
 
-  await test("47. Count 文案在列表与描述中严格规范为“话”", async () => {
+  await test("47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 book:<Id>", async () => {
     const { source } = createSourceHarness();
 
     const comicItem = source._comicFromListItem({
@@ -2746,6 +2767,8 @@ async function runTests() {
       LastUpdatedAt: "2026-09-06",
     });
 
+    assert.strictEqual(comicItem.id, "book:123", "列表卡片 ID 必须统一格式化为 book:<Id>");
+    assert.strictEqual(comicItem.title, "测试漫画");
     assert.strictEqual(comicItem.subTitle, "25 话");
     assert.strictEqual(comicItem.description, "共 25 话 · 更新: 2026-09-06");
   });
@@ -2939,7 +2962,7 @@ async function runTests() {
     );
   });
 
-  await test("50. 坏 persistent 映射（契约错误或 SeriesTitle 不一致）清理旧映射并 exact→fuzzy 恢复新 ID，同一坏 ID 绝不循环", async () => {
+  await test("50. 坏 persistent 映射校验失败先保留，候选验证成功后原子替换；全失败保留旧映射绝不循环", async () => {
     const { source } = createSourceHarness();
 
     // 1. 预置旧的坏 persistent 映射：旧标题 "坏标题漫画" -> 旧 Book.Id 555
@@ -2981,26 +3004,22 @@ async function runTests() {
         if (params.KeyWords === "坏标题漫画") {
           return {
             Data: [{ Id: 666, Title: "坏标题漫画" }],
+            TotalPages: 1,
           };
         }
       }
       throw new Error(`Unexpected call: ${target}`);
     };
 
-    // 执行 loadInfo，触发契约不一致与 exact 恢复
+    // 执行 loadInfo，触发契约不一致、旧映射保留并被新候选原子替换
     const details = await source.comic.loadInfo("坏标题漫画");
     assert.strictEqual(details.title, "坏标题漫画");
     assert.strictEqual(details.subId, "666");
 
-    // 检查旧的坏映射 555 已被替换为新的 666
+    // 检查旧的坏映射 555 已在验证成功后原子替换为新的 666
     assert.strictEqual(source._getPersistentSeriesBookId("坏标题漫画"), 666);
-    assert.strictEqual(
-      source._bookInfoCache.has(source._bookInfoCacheKey(555)),
-      false,
-      "旧的坏 Book.Id 555 缓存必须被清除",
-    );
 
-    // 2. 验证：若搜索重新解析得到的仍然是同一个坏 ID，必须直接报错，绝不循环
+    // 2. 验证：若搜索重新解析得到的仍然是同一个坏 ID，必须保留旧映射并直接报错，绝不循环
     source._clearComicContentStates();
     source._setPersistentSeriesBookId("死循环测试漫画", 777);
 
@@ -3015,9 +3034,9 @@ async function runTests() {
         }
       }
       if (target === "SearchComicSeries") {
-        // 搜索依然返回 777
         return {
           Data: [{ Id: 777, Title: "死循环测试漫画" }],
+          TotalPages: 1,
         };
       }
       throw new Error(`Unexpected call: ${target}`);
@@ -3029,10 +3048,15 @@ async function runTests() {
     } catch (e) {
       loopErr = e;
     }
-    assert.ok(loopErr, "搜索得到同一坏 ID 时必须坚决报错中断");
+    assert.ok(loopErr, "搜索得到同一坏 ID 且校验失败时必须坚决报错中断");
+    assert.strictEqual(
+      source._getPersistentSeriesBookId("死循环测试漫画"),
+      777,
+      "无可用新候选验证通过时必须保留旧映射",
+    );
     assert.match(
       loopErr.message,
-      /GetBookInfo 返回的 SeriesTitle 与请求不一致/,
+      /无法解析漫画“死循环测试漫画”对应的 Book\.Id.*已保留旧持久映射 777/,
     );
   });
 
@@ -3193,7 +3217,32 @@ async function runTests() {
     assert.strictEqual(directRes.bookId, 123);
     assert.strictEqual(directRes.source, "direct");
 
-    // 2. persistent 来源追踪
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        if (params.Id === 456) {
+          return {
+            SeriesTitle: "持久追踪漫画",
+            Series: [{ Id: 456, Title: "持久追踪漫画" }],
+            Book: { Id: 456, Type: "Comic", Title: "持久追踪漫画", Chapters: [] },
+          };
+        }
+        if (params.Id === 789) {
+          return {
+            SeriesTitle: "搜索精确漫画",
+            Series: [{ Id: 789, Title: "搜索精确漫画" }],
+            Book: { Id: 789, Type: "Comic", Title: "搜索精确漫画", Chapters: [] },
+          };
+        }
+      }
+      if (target === "SearchComicSeries") {
+        if (params.KeyWords === "搜索精确漫画") {
+          return { Data: [{ Id: 789, Title: "搜索精确漫画" }], TotalPages: 1 };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 2. persistent 来源追踪（以 GetBookInfo 严格校验）
     source._setPersistentSeriesBookId("持久追踪漫画", 456);
     const persistentRes = await source._resolveRepresentativeBookId(
       "持久追踪漫画",
@@ -3222,15 +3271,7 @@ async function runTests() {
     assert.strictEqual(memoryRes.bookId, 456);
     assert.strictEqual(memoryRes.source, "persistent");
 
-    // 4. search exact 来源追踪
-    source._hubCall = async (target, params) => {
-      if (target === "SearchComicSeries") {
-        if (params.Mode === "exact") {
-          return { Data: [{ Id: 789, Title: "搜索精确漫画" }] };
-        }
-      }
-      throw new Error(`Unexpected call: ${target}`);
-    };
+    // 4. search 来源追踪
     const exactRes = await source._resolveRepresentativeBookId(
       "搜索精确漫画",
       { detailed: true },
@@ -3238,12 +3279,11 @@ async function runTests() {
     assert.deepStrictEqual(JSON.parse(JSON.stringify(exactRes)), {
       id: 789,
       bookId: 789,
-      source: "exact",
+      source: "title",
     });
     assert.strictEqual(exactRes.id, 789);
     assert.strictEqual(exactRes.bookId, 789);
-    assert.strictEqual(exactRes.source, "exact");
-
+    assert.strictEqual(exactRes.source, "title");
     // 5. 精准删除标题映射
     source._bookInfoCache.set(source._bookInfoCacheKey(456), {
       data: {
@@ -3272,27 +3312,26 @@ async function runTests() {
     );
   });
 
-  await test("55. 真实 smoke 所需 direct SearchComicSeries Mode=exact 路径与 safe shape 诊断核验", async () => {
+  await test("55. 真实 smoke 主路径：direct book:<id> 安全形态诊断与 loadInfo 零搜索验证", async () => {
     const { source } = createSourceHarness();
 
     const targetTitle = "Smoke核验漫画";
-    const exactBookId = 654;
+    const bookId = 654;
+    const directId = `book:${bookId}`;
+    let searchCalled = false;
 
     source._hubCall = async (target, params) => {
       if (target === "SearchComicSeries") {
-        assert.strictEqual(params.Mode, "exact");
-        assert.strictEqual(params.KeyWords, targetTitle);
-        return {
-          Data: [{ Id: exactBookId, Title: targetTitle }],
-        };
+        searchCalled = true;
+        throw new Error("direct ID 路径坚决禁止发起 SearchComicSeries 搜索！");
       }
       if (target === "GetBookInfo") {
-        assert.strictEqual(params.Id, exactBookId);
+        assert.strictEqual(params.Id, bookId);
         return {
           SeriesTitle: targetTitle,
-          Series: [{ Id: exactBookId, Title: targetTitle }],
+          Series: [{ Id: bookId, Title: targetTitle }],
           Book: {
-            Id: exactBookId,
+            Id: bookId,
             Type: "Comic",
             Title: targetTitle,
             Chapters: [{ Id: 6541, SortNum: 1, Title: "第1话" }],
@@ -3302,24 +3341,7 @@ async function runTests() {
       throw new Error(`Unexpected call: ${target}`);
     };
 
-    // 模拟真实 smoke 流程：直接调用 SearchComicSeries Mode=exact
-    const searchData = await source._hubCall("SearchComicSeries", {
-      KeyWords: targetTitle,
-      Mode: "exact",
-      Page: 1,
-      Size: 20,
-    });
-    const items = source._value(searchData, "data", "Data", []);
-    const match = items.find(
-      (item) =>
-        String(source._value(item, "title", "Title", "") || "").trim() ===
-        targetTitle,
-    );
-    assert.ok(match, "必须匹配到 exact 标题");
-    const bookId = Number(source._value(match, "id", "Id", NaN));
-    assert.strictEqual(bookId, exactBookId);
-
-    // 校验 GetBookInfo 原始响应安全形态诊断
+    // 1. 模拟真实 smoke 流程：直接以 BookId 调用 GetBookInfo 原始安全形态诊断
     const rawData = await source._hubCall("GetBookInfo", { Id: bookId });
     const hasNestedBook = source._value(rawData, "book", "Book", null);
     const shape =
@@ -3328,9 +3350,156 @@ async function runTests() {
         : "root-book";
     assert.strictEqual(shape, "nested-book");
 
-    const details = await source.comic.loadInfo(targetTitle);
+    // 2. 模拟真实 smoke 主路径：直接以 book:<Id> 加载详情，断言完全跳过搜索
+    const details = await source.comic.loadInfo(directId);
+    assert.strictEqual(searchCalled, false, "direct ID 必须完全跳过搜索");
     assert.strictEqual(details.title, targetTitle);
-    assert.strictEqual(details.subId, String(exactBookId));
+    assert.strictEqual(details.subId, String(bookId));
+  });
+
+  await test("56. 新列表/发现/历史/搜索输出全部为 book:<正整数>，严格校验代表 Book.Id", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. _comicFromListItem 校验有效与无效 Id
+    const valid = source._comicFromListItem({ Id: 9527, Title: "有效漫画" });
+    assert.strictEqual(valid.id, "book:9527");
+    assert.strictEqual(valid.title, "有效漫画");
+
+    for (const badId of [null, undefined, 0, -1, NaN, "abc", Infinity]) {
+      assert.throws(
+        () => source._comicFromListItem({ Id: badId, Title: "坏ID漫画" }),
+        /无效漫画代表 Book\.Id/,
+      );
+    }
+    assert.throws(
+      () => source._comicFromListItem({ Id: 100, Title: "" }),
+      /无效漫画标题/,
+    );
+
+    // 2. _comicListFromResponse (列表/分类输出)
+    const listData = {
+      Data: [
+        { Id: 101, Title: "列表1" },
+        { Id: 102, Title: "列表2" },
+      ],
+      TotalPages: 2,
+    };
+    const listRes = source._comicListFromResponse(listData);
+    assert.strictEqual(listRes.comics[0].id, "book:101");
+    assert.strictEqual(listRes.comics[1].id, "book:102");
+
+    // 3. _historyComicsFromResponse (阅读历史输出)
+    const seen = new Set();
+    const historyRes = source._historyComicsFromResponse(
+      { Data: [{ Id: 201, Title: "历史1" }] },
+      seen,
+    );
+    assert.strictEqual(historyRes[0].id, "book:201");
+    assert.ok(seen.has("book:201"));
+
+    // 4. search.load 输出
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        return {
+          Data: [{ Id: 301, Title: "搜索1" }],
+          TotalPages: 1,
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+    const searchRes = await source.search.load("关键词", ["fuzzy"], 1);
+    assert.strictEqual(searchRes.comics[0].id, "book:301");
+  });
+
+  await test("57. legacy 恢复从官方 GetReadHistory 按 24 本分片串行恢复并严格验证", async () => {
+    const { source } = createSourceHarness();
+
+    const bookListCalls = [];
+    source._hubCall = async (target, params) => {
+      if (target === "GetReadHistory") {
+        // 返回 30 本历史记录，触发受限分片 (第一批 24，第二批 6)
+        const ids = Array.from({ length: 30 }, (_, i) => i + 1000);
+        return { Comic: ids };
+      }
+      if (target === "GetBookListByIds") {
+        bookListCalls.push(params);
+        assert.strictEqual(params.Type, "Comic");
+        assert.ok(params.Ids.length <= 24, "分片大小不得超过 24 本");
+        if (params.Ids.includes(1025)) {
+          return {
+            Data: [
+              { Id: 1025, Title: "历史中的漫画" },
+            ],
+          };
+        }
+        return { Data: [] };
+      }
+      if (target === "GetBookInfo") {
+        if (params.Id === 1025) {
+          return {
+            SeriesTitle: "历史中的漫画",
+            Series: [{ Id: 1025, Title: "历史中的漫画" }],
+            Book: {
+              Id: 1025,
+              Type: "Comic",
+              Title: "历史中的漫画",
+              Chapters: [{ Id: 9001, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const res = await source._resolveRepresentativeBookId("历史中的漫画", {
+      detailed: true,
+    });
+    assert.strictEqual(res.id, 1025);
+    assert.strictEqual(res.source, "history");
+    assert.strictEqual(bookListCalls.length, 2, "应分两批且每批不超过 24 本串行请求");
+    assert.strictEqual(bookListCalls[0].Ids.length, 24);
+    assert.strictEqual(bookListCalls[1].Ids.length, 6);
+    assert.strictEqual(
+      source._getPersistentSeriesBookId("历史中的漫画"),
+      1025,
+      "历史恢复成功后应写入持久映射",
+    );
+  });
+
+  await test("58. 确定性无结果建立短时负缓存且同标题并发共享 Promise 单飞，登出/清理重置负缓存", async () => {
+    const { source } = createSourceHarness();
+
+    let searchCalls = 0;
+    source._hubCall = async (target, params) => {
+      if (target === "GetReadHistory") return { Comic: [] };
+      if (target === "SearchComicSeries") {
+        searchCalls += 1;
+        // 人为微延迟，让并发请求汇入同一 in-flight Promise
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { Data: [], TotalPages: 1 };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 1. 同标题并发单飞测试
+    const [err1, err2] = await Promise.all([
+      source._resolveRepresentativeBookId("并发无结果漫画").catch((e) => e),
+      source._resolveRepresentativeBookId("并发无结果漫画").catch((e) => e),
+    ]);
+    assert.ok(err1 && err2);
+    assert.strictEqual(err1.message, err2.message);
+    // 4 个搜索模式 (title, exact, name, fuzzy) 各 1 次，并发调用下不翻倍
+    assert.strictEqual(searchCalls, 4, "并发恢复应共享单一 Promise，调用次数不得翻倍");
+
+    // 2. 负缓存短时拦截：再次调用不发起任何网络请求
+    const callsBefore = searchCalls;
+    const err3 = await source._resolveRepresentativeBookId("并发无结果漫画").catch((e) => e);
+    assert.ok(err3);
+    assert.strictEqual(searchCalls, callsBefore, "负缓存命中期间不应产生新调用");
+
+    // 3. 登出清理：重置负缓存
+    source._clearComicContentStates();
+    assert.strictEqual(source._seriesNegativeCache.size, 0, "清理入口必须清空负缓存");
   });
 
   assert.strictEqual(
