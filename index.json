@@ -206,7 +206,7 @@
         "name": "轻书架",
         "fileName": "lightnovelshelf.js",
         "key": "LightNovelShelf",
-        "version": "0.3.3",
-        "description": "轻书架漫画源，支持新版 GetBookInfo 多上传版本详情与 direct ID 直连、Book 评论、SeriesTitle 持久映射、发现页容错、邮箱密码与 RefreshToken+x-id Token 登录、每日签到、WebSocket 长连接、Gzip 响应及阅读进度保存"
+        "version": "0.3.4",
+        "description": "轻书架漫画源，支持新版 GetBookInfo 兼容 nested 与 root-level Book 规范化、SeriesTitle 坏映射严格恢复与 direct ID 直连、Book 评论、发现页容错、邮箱密码与 RefreshToken+x-id Token 登录、每日签到、WebSocket 长连接、Gzip 响应及阅读进度保存"
     }
 ]

@@ -52,6 +52,14 @@
  * 45. 发现页首层多区块独立 settle、局部失败容错与全部失败抛错
  * 46. 正文 GetComicContent 校验 Chapter.Id 并回填 BookId 支持 SaveReadPosition
  * 47. Count 文案在列表与描述中严格规范为“话”
+ * 48. BookInfo 规范化兼容 nested (data.Book) 与 root (根级对象) 两形态
+ * 49. 无效响应（null/string/空对象/Id不匹配/非Comic/Chapters非数组）不缓存并抛出安全诊断且再次请求重新拉取
+ * 50. 坏 persistent 映射（契约错误或 SeriesTitle 不一致）清理旧映射并 exact→fuzzy 恢复新 ID，同一坏 ID 绝不循环
+ * 51. direct ID 遇到 BookInfo 错误坚决不搜索
+ * 52. 网络/认证/超时/限流运行错误坚决不删除 persistent 映射
+ * 53. 主次 Book 响应形态混合（主 Book 为 root 形态，次 Book 为 nested 形态且异常时降级）
+ * 54. 来源追踪解析与精准删除标题映射方法验证
+ * 55. 真实 smoke 所需 direct SearchComicSeries Mode=exact 路径与 safe shape 诊断核验
  */
 
 const fs = require("node:fs");
@@ -2221,7 +2229,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.3.3");
+    assert.strictEqual(source.version, "0.3.4");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -2740,6 +2748,589 @@ async function runTests() {
 
     assert.strictEqual(comicItem.subTitle, "25 话");
     assert.strictEqual(comicItem.description, "共 25 话 · 更新: 2026-09-06");
+  });
+
+  await test("48. BookInfo 规范化兼容 nested (data.Book) 与 root (根级对象) 两形态", async () => {
+    const { source } = createSourceHarness();
+
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        if (params.Id === 101) {
+          // 形态 1: 嵌套结构 (data.Book)
+          return {
+            SeriesTitle: "嵌套漫画",
+            Series: [{ Id: 101, Title: "嵌套漫画" }],
+            Book: {
+              Id: 101,
+              Type: "Comic",
+              Title: "嵌套漫画",
+              Introduction: "嵌套简介",
+              Chapters: [
+                { Id: 1001, SortNum: 1, Title: "第一话", PageCount: 10 },
+              ],
+            },
+          };
+        }
+        if (params.Id === 202) {
+          // 形态 2: 根级结构 (data 直接包含 Book 字段)
+          return {
+            SeriesTitle: "根级漫画",
+            Series: [{ Id: 202, Title: "根级漫画" }],
+            Id: 202,
+            Type: "Comic",
+            Title: "根级漫画",
+            Introduction: "根级简介",
+            Chapters: [
+              { Id: 2001, SortNum: 1, Title: "第1话", PageCount: 20 },
+            ],
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 验证 nested 详情加载
+    const detailsNested = await source.comic.loadInfo("book:101");
+    assert.strictEqual(detailsNested.title, "嵌套漫画");
+    assert.strictEqual(detailsNested.subId, "101");
+    assert.strictEqual(detailsNested.description, "嵌套简介");
+    assert.strictEqual(detailsNested.chapters.size, 1);
+    assert.strictEqual(source._knownComicPageCount("book:101", 1001), 10);
+
+    // 验证 root 详情加载
+    const detailsRoot = await source.comic.loadInfo("book:202");
+    assert.strictEqual(detailsRoot.title, "根级漫画");
+    assert.strictEqual(detailsRoot.subId, "202");
+    assert.strictEqual(detailsRoot.description, "根级简介");
+    assert.strictEqual(detailsRoot.chapters.size, 1);
+    assert.strictEqual(source._knownComicPageCount("book:202", 2001), 20);
+
+    // 验证两者的内部规范化缓存结构均包含统一的 book/Book 字段
+    const cachedNested = source._bookInfoCache.get(
+      source._bookInfoCacheKey(101),
+    );
+    assert.ok(cachedNested && cachedNested.data);
+    assert.strictEqual(cachedNested.data.seriesTitle, "嵌套漫画");
+    assert.strictEqual(cachedNested.data.book.id, 101);
+    assert.strictEqual(cachedNested.data.book.type, "Comic");
+
+    const cachedRoot = source._bookInfoCache.get(
+      source._bookInfoCacheKey(202),
+    );
+    assert.ok(cachedRoot && cachedRoot.data);
+    assert.strictEqual(cachedRoot.data.seriesTitle, "根级漫画");
+    assert.strictEqual(cachedRoot.data.book.id, 202);
+    assert.strictEqual(cachedRoot.data.book.type, "Comic");
+  });
+
+  await test("49. 无效响应（null/string/空对象/Id不匹配/非Comic/Chapters非数组）不缓存并抛出安全诊断且再次请求重新拉取", async () => {
+    const { source } = createSourceHarness();
+
+    let callCount = 0;
+    let mockResponse = null;
+
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        callCount++;
+        return mockResponse;
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const invalidCases = [
+      { name: "null 响应", res: null },
+      { name: "string 响应", res: "invalid-string" },
+      { name: "空对象", res: {} },
+      {
+        name: "缺少 SeriesTitle",
+        res: { Series: [], Book: { Id: 300, Type: "Comic", Chapters: [] } },
+      },
+      {
+        name: "Series 非数组",
+        res: {
+          SeriesTitle: "T",
+          Series: "not-array",
+          Book: { Id: 300, Type: "Comic", Chapters: [] },
+        },
+      },
+      {
+        name: "Book.Id 不匹配",
+        res: {
+          SeriesTitle: "T",
+          Series: [],
+          Book: { Id: 999, Type: "Comic", Chapters: [] },
+        },
+      },
+      {
+        name: "非 Comic 类型",
+        res: {
+          SeriesTitle: "T",
+          Series: [],
+          Book: { Id: 300, Type: "Novel", Chapters: [] },
+        },
+      },
+      {
+        name: "Chapters 非数组",
+        res: {
+          SeriesTitle: "T",
+          Series: [],
+          Book: { Id: 300, Type: "Comic", Chapters: null },
+        },
+      },
+    ];
+
+    for (const testCase of invalidCases) {
+      mockResponse = testCase.res;
+      let caught = null;
+      try {
+        await source._getBookInfo(300);
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught, `${testCase.name} 必须抛出契约错误`);
+      assert.ok(
+        caught.isBookInfoContractError,
+        "错误对象必须标记 isBookInfoContractError",
+      );
+      assert.strictEqual(
+        caught.requestedBookId,
+        300,
+        "错误诊断必须携带 requestedBookId",
+      );
+      assert.ok(
+        caught.message.includes("requested Book.Id: 300"),
+        "错误信息必须包含 requested Book.Id",
+      );
+      assert.strictEqual(
+        source._bookInfoCache.has(source._bookInfoCacheKey(300)),
+        false,
+        `${testCase.name} 坚决不得存入缓存`,
+      );
+    }
+
+    // 验证后续有效响应能成功执行并缓存
+    mockResponse = {
+      SeriesTitle: "正常漫画",
+      Series: [{ Id: 300, Title: "正常漫画" }],
+      Book: {
+        Id: 300,
+        Type: "Comic",
+        Title: "正常漫画",
+        Chapters: [{ Id: 3001, SortNum: 1, Title: "第1话" }],
+      },
+    };
+
+    const validData = await source._getBookInfo(300);
+    assert.strictEqual(validData.seriesTitle, "正常漫画");
+    assert.strictEqual(
+      source._bookInfoCache.has(source._bookInfoCacheKey(300)),
+      true,
+      "有效响应必须正常缓存",
+    );
+
+    // 再次调用命中缓存，不再发起远程 Hub 调用
+    const prevCalls = callCount;
+    const fromCache = await source._getBookInfo(300);
+    assert.strictEqual(fromCache.seriesTitle, "正常漫画");
+    assert.strictEqual(
+      callCount,
+      prevCalls,
+      "命中有效缓存时不应发起 Hub 请求",
+    );
+  });
+
+  await test("50. 坏 persistent 映射（契约错误或 SeriesTitle 不一致）清理旧映射并 exact→fuzzy 恢复新 ID，同一坏 ID 绝不循环", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. 预置旧的坏 persistent 映射：旧标题 "坏标题漫画" -> 旧 Book.Id 555
+    source._setPersistentSeriesBookId("坏标题漫画", 555);
+    assert.strictEqual(source._getPersistentSeriesBookId("坏标题漫画"), 555);
+
+    const calls = [];
+    source._hubCall = async (target, params) => {
+      calls.push({ target, params });
+      if (target === "GetBookInfo") {
+        if (params.Id === 555) {
+          // 旧 BookId 返回了错误的 SeriesTitle（或契约错误）
+          return {
+            SeriesTitle: "完全不相干漫画",
+            Series: [{ Id: 555, Title: "完全不相干漫画" }],
+            Book: {
+              Id: 555,
+              Type: "Comic",
+              Title: "完全不相干漫画",
+              Chapters: [],
+            },
+          };
+        }
+        if (params.Id === 666) {
+          // 新搜出来的正确 BookId
+          return {
+            SeriesTitle: "坏标题漫画",
+            Series: [{ Id: 666, Title: "坏标题漫画" }],
+            Book: {
+              Id: 666,
+              Type: "Comic",
+              Title: "坏标题漫画",
+              Chapters: [{ Id: 6001, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+      }
+      if (target === "SearchComicSeries") {
+        if (params.KeyWords === "坏标题漫画") {
+          return {
+            Data: [{ Id: 666, Title: "坏标题漫画" }],
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 执行 loadInfo，触发契约不一致与 exact 恢复
+    const details = await source.comic.loadInfo("坏标题漫画");
+    assert.strictEqual(details.title, "坏标题漫画");
+    assert.strictEqual(details.subId, "666");
+
+    // 检查旧的坏映射 555 已被替换为新的 666
+    assert.strictEqual(source._getPersistentSeriesBookId("坏标题漫画"), 666);
+    assert.strictEqual(
+      source._bookInfoCache.has(source._bookInfoCacheKey(555)),
+      false,
+      "旧的坏 Book.Id 555 缓存必须被清除",
+    );
+
+    // 2. 验证：若搜索重新解析得到的仍然是同一个坏 ID，必须直接报错，绝不循环
+    source._clearComicContentStates();
+    source._setPersistentSeriesBookId("死循环测试漫画", 777);
+
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        if (params.Id === 777) {
+          return {
+            SeriesTitle: "其他漫画",
+            Series: [{ Id: 777, Title: "其他漫画" }],
+            Book: { Id: 777, Type: "Comic", Title: "其他漫画", Chapters: [] },
+          };
+        }
+      }
+      if (target === "SearchComicSeries") {
+        // 搜索依然返回 777
+        return {
+          Data: [{ Id: 777, Title: "死循环测试漫画" }],
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    let loopErr = null;
+    try {
+      await source.comic.loadInfo("死循环测试漫画");
+    } catch (e) {
+      loopErr = e;
+    }
+    assert.ok(loopErr, "搜索得到同一坏 ID 时必须坚决报错中断");
+    assert.match(
+      loopErr.message,
+      /GetBookInfo 返回的 SeriesTitle 与请求不一致/,
+    );
+  });
+
+  await test("51. direct ID 遇到 BookInfo 错误坚决不搜索", async () => {
+    const { source } = createSourceHarness();
+
+    let searchCalled = false;
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searchCalled = true;
+        throw new Error("direct ID 不得发起搜索");
+      }
+      if (target === "GetBookInfo") {
+        if (params.Id === 999) {
+          // 返回非 Comic 类型错误
+          return {
+            SeriesTitle: "直连漫画",
+            Series: [{ Id: 999, Title: "直连漫画" }],
+            Book: { Id: 999, Type: "Novel", Chapters: [] },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    let directErr = null;
+    try {
+      await source.comic.loadInfo("book:999");
+    } catch (e) {
+      directErr = e;
+    }
+    assert.ok(directErr, "direct ID 契约不满足时必须抛错");
+    assert.strictEqual(
+      searchCalled,
+      false,
+      "direct ID 遇到错误坚决不触发搜索",
+    );
+  });
+
+  await test("52. 网络/认证/超时/限流运行错误坚决不删除 persistent 映射", async () => {
+    const { source } = createSourceHarness();
+
+    source._setPersistentSeriesBookId("网络漫画", 888);
+    assert.strictEqual(source._getPersistentSeriesBookId("网络漫画"), 888);
+
+    const operationalErrors = [
+      new Error("401 Unauthorized: token expired"),
+      source._hubTransportError("WebSocket connection closed"),
+      source._hubTimeoutError("Invocation timed out after 30000ms"),
+      new Error("HTTP 429 Too Many Requests: 限流"),
+    ];
+
+    for (const opErr of operationalErrors) {
+      source._hubCall = async (target) => {
+        if (target === "GetBookInfo") {
+          throw opErr;
+        }
+        throw new Error(`Unexpected call: ${target}`);
+      };
+
+      let caught = null;
+      try {
+        await source.comic.loadInfo("网络漫画");
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, "运行错误必须向外抛出");
+      assert.strictEqual(
+        source._getPersistentSeriesBookId("网络漫画"),
+        888,
+        "网络/认证/超时/限流错误绝不得删除持久化映射",
+      );
+    }
+  });
+
+  await test("53. 主次 Book 响应形态混合（主 Book 为 root 形态，次 Book 为 nested 形态且异常时降级）", async () => {
+    const { source } = createSourceHarness();
+
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        if (params.Id === 100) {
+          // 主 Book：root 根级形态
+          return {
+            SeriesTitle: "混合系列",
+            Series: [
+              { Id: 100, Title: "主卷" },
+              { Id: 200, Title: "次卷 1" },
+              { Id: 300, Title: "次卷 2" },
+            ],
+            Id: 100,
+            Type: "Comic",
+            Title: "主卷",
+            Chapters: [
+              { Id: 1001, SortNum: 1, Title: "主卷第1话", PageCount: 5 },
+            ],
+            User: { UserName: "主上传者" },
+          };
+        }
+        if (params.Id === 200) {
+          // 次 Book 1：nested 嵌套形态
+          return {
+            SeriesTitle: "混合系列",
+            Series: [{ Id: 200, Title: "次卷 1" }],
+            Book: {
+              Id: 200,
+              Type: "Comic",
+              Title: "次卷 1",
+              Chapters: [
+                { Id: 2001, SortNum: 1, Title: "次卷第1话", PageCount: 6 },
+              ],
+              User: { UserName: "次上传者" },
+            },
+          };
+        }
+        if (params.Id === 300) {
+          // 次 Book 2：无效契约响应（非 Comic）
+          return {
+            SeriesTitle: "混合系列",
+            Series: [{ Id: 300, Title: "次卷 2" }],
+            Book: {
+              Id: 300,
+              Type: "Novel",
+              Chapters: [],
+            },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const details = await source.comic.loadInfo("book:100");
+    assert.strictEqual(details.title, "混合系列");
+    assert.strictEqual(details.subId, "100");
+
+    // 主卷与次卷 1 均成功聚合，次卷 2 优雅降级忽略
+    const chapterMap = details.chapters;
+    assert.ok(chapterMap.has("主卷"));
+    assert.ok(chapterMap.has("次卷 1"));
+    assert.strictEqual(chapterMap.size, 2);
+
+    assert.strictEqual(source._knownComicPageCount("book:100", 1001), 5);
+    assert.strictEqual(source._knownComicPageCount("book:100", 2001), 6);
+  });
+
+  await test("54. 来源追踪解析与精准删除标题映射方法验证", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. direct ID 来源追踪
+    const directRes = await source._resolveRepresentativeBookId("book:123", {
+      detailed: true,
+    });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(directRes)), {
+      id: 123,
+      bookId: 123,
+      source: "direct",
+    });
+    assert.strictEqual(directRes.id, 123);
+    assert.strictEqual(directRes.bookId, 123);
+    assert.strictEqual(directRes.source, "direct");
+
+    // 2. persistent 来源追踪
+    source._setPersistentSeriesBookId("持久追踪漫画", 456);
+    const persistentRes = await source._resolveRepresentativeBookId(
+      "持久追踪漫画",
+      { detailed: true },
+    );
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(persistentRes)), {
+      id: 456,
+      bookId: 456,
+      source: "persistent",
+    });
+    assert.strictEqual(persistentRes.id, 456);
+    assert.strictEqual(persistentRes.bookId, 456);
+    assert.strictEqual(persistentRes.source, "persistent");
+
+    // 3. memory 来源追踪
+    const memoryRes = await source._resolveRepresentativeBookId(
+      "持久追踪漫画",
+      { detailed: true },
+    );
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(memoryRes)), {
+      id: 456,
+      bookId: 456,
+      source: "persistent",
+    });
+    assert.strictEqual(memoryRes.id, 456);
+    assert.strictEqual(memoryRes.bookId, 456);
+    assert.strictEqual(memoryRes.source, "persistent");
+
+    // 4. search exact 来源追踪
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        if (params.Mode === "exact") {
+          return { Data: [{ Id: 789, Title: "搜索精确漫画" }] };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+    const exactRes = await source._resolveRepresentativeBookId(
+      "搜索精确漫画",
+      { detailed: true },
+    );
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(exactRes)), {
+      id: 789,
+      bookId: 789,
+      source: "exact",
+    });
+    assert.strictEqual(exactRes.id, 789);
+    assert.strictEqual(exactRes.bookId, 789);
+    assert.strictEqual(exactRes.source, "exact");
+
+    // 5. 精准删除标题映射
+    source._bookInfoCache.set(source._bookInfoCacheKey(456), {
+      data: {
+        seriesTitle: "持久追踪漫画",
+        series: [],
+        book: { id: 456, type: "Comic", chapters: [] },
+      },
+      fetchedAt: Date.now(),
+    });
+    assert.ok(source._bookInfoCache.has(source._bookInfoCacheKey(456)));
+
+    source._deleteSeriesBookMapping("持久追踪漫画", 456);
+    assert.strictEqual(
+      source._getPersistentSeriesBookId("持久追踪漫画"),
+      null,
+    );
+    assert.strictEqual(
+      source._seriesRepresentativeBookIds.has(
+        source._seriesCacheKey("持久追踪漫画"),
+      ),
+      false,
+    );
+    assert.strictEqual(
+      source._bookInfoCache.has(source._bookInfoCacheKey(456)),
+      false,
+    );
+  });
+
+  await test("55. 真实 smoke 所需 direct SearchComicSeries Mode=exact 路径与 safe shape 诊断核验", async () => {
+    const { source } = createSourceHarness();
+
+    const targetTitle = "Smoke核验漫画";
+    const exactBookId = 654;
+
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        assert.strictEqual(params.Mode, "exact");
+        assert.strictEqual(params.KeyWords, targetTitle);
+        return {
+          Data: [{ Id: exactBookId, Title: targetTitle }],
+        };
+      }
+      if (target === "GetBookInfo") {
+        assert.strictEqual(params.Id, exactBookId);
+        return {
+          SeriesTitle: targetTitle,
+          Series: [{ Id: exactBookId, Title: targetTitle }],
+          Book: {
+            Id: exactBookId,
+            Type: "Comic",
+            Title: targetTitle,
+            Chapters: [{ Id: 6541, SortNum: 1, Title: "第1话" }],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 模拟真实 smoke 流程：直接调用 SearchComicSeries Mode=exact
+    const searchData = await source._hubCall("SearchComicSeries", {
+      KeyWords: targetTitle,
+      Mode: "exact",
+      Page: 1,
+      Size: 20,
+    });
+    const items = source._value(searchData, "data", "Data", []);
+    const match = items.find(
+      (item) =>
+        String(source._value(item, "title", "Title", "") || "").trim() ===
+        targetTitle,
+    );
+    assert.ok(match, "必须匹配到 exact 标题");
+    const bookId = Number(source._value(match, "id", "Id", NaN));
+    assert.strictEqual(bookId, exactBookId);
+
+    // 校验 GetBookInfo 原始响应安全形态诊断
+    const rawData = await source._hubCall("GetBookInfo", { Id: bookId });
+    const hasNestedBook = source._value(rawData, "book", "Book", null);
+    const shape =
+      hasNestedBook && typeof hasNestedBook === "object"
+        ? "nested-book"
+        : "root-book";
+    assert.strictEqual(shape, "nested-book");
+
+    const details = await source.comic.loadInfo(targetTitle);
+    assert.strictEqual(details.title, targetTitle);
+    assert.strictEqual(details.subId, String(exactBookId));
   });
 
   assert.strictEqual(

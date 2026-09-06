@@ -401,17 +401,105 @@ async function runSmoke() {
 
     const targetComic = latest.comics[0];
     const targetTitle = targetComic.title;
+    const targetKey = source._seriesCacheKey(targetTitle);
+    const targetListMeta = source._seriesListMetadata.get(targetKey);
+    const originalListId = targetListMeta
+      ? targetListMeta.representativeBookId
+      : null;
+    console.log(
+      `  ✓ 选定目标漫画: “${targetTitle}” (原始列表 representativeBookId: ${originalListId || "未知"})`,
+    );
 
-    // 3. 测试 exact 搜索解析
+    // 3. 测试 exact 搜索解析（直接调用 SearchComicSeries Mode=exact 并严格核验，不得通过 resolver 假验证）
     console.log(`\n[3/8] 验证 SearchComicSeries (exact: “${targetTitle}”)...`);
-    const resolvedBookId = await source._resolveRepresentativeBookId(targetTitle);
-    if (!Number.isSafeInteger(resolvedBookId) || resolvedBookId <= 0) {
-      throw new Error(`无法精确解析 “${targetTitle}” 对应的 Book.Id`);
+    const searchResult = await source._hubCall(
+      "SearchComicSeries",
+      {
+        KeyWords: targetTitle,
+        Mode: "exact",
+        Page: 1,
+        Size: 20,
+        IgnoreJapanese: !!source.loadSetting("ignoreJapanese"),
+        IgnoreAI: !!source.loadSetting("ignoreAI"),
+      },
+      { retryTransport: true },
+    );
+    const searchItems = source._value(searchResult, "data", "Data", []);
+    const exactMatch = (Array.isArray(searchItems) ? searchItems : []).find(
+      (item) =>
+        String(source._value(item, "title", "Title", "") || "").trim() ===
+        targetTitle,
+    );
+    if (!exactMatch) {
+      throw new Error(
+        `SearchComicSeries exact 搜索未找到严格匹配项: “${targetTitle}”`,
+      );
     }
-    console.log(`  ✓ exact 匹配成功, Book.Id: ${resolvedBookId}`);
+    const exactBookId = Number(source._value(exactMatch, "id", "Id", NaN));
+    if (!Number.isSafeInteger(exactBookId) || exactBookId <= 0) {
+      throw new Error(
+        `SearchComicSeries exact 返回了无效的 Book.Id: ${exactBookId}`,
+      );
+    }
+    const resolvedBookId = exactBookId;
+    console.log(`  ✓ SearchComicSeries Mode=exact 成功, 返回 Book.Id: ${resolvedBookId}`);
 
-    // 4. 测试 GetBookInfo
+    // 4. 测试 GetBookInfo（只读获取原始响应形态并安全诊断，再通过 comic.loadInfo 校验完整详情）
     console.log(`\n[4/8] 验证 GetBookInfo (BookId: ${resolvedBookId})...`);
+    const rawBookInfo = await source._hubCall(
+      "GetBookInfo",
+      { Id: resolvedBookId },
+      { retryTransport: true },
+    );
+    let responseShape = "invalid";
+    let returnedBookId = null;
+    let respSeriesTitle = "";
+    let seriesCount = 0;
+    let chaptersCount = 0;
+
+    if (
+      rawBookInfo &&
+      typeof rawBookInfo === "object" &&
+      !Array.isArray(rawBookInfo)
+    ) {
+      respSeriesTitle = String(
+        source._value(rawBookInfo, "seriesTitle", "SeriesTitle", "") || "",
+      );
+      const rawSeries = source._value(rawBookInfo, "series", "Series", null);
+      seriesCount = Array.isArray(rawSeries) ? rawSeries.length : 0;
+
+      const rawBook = source._value(rawBookInfo, "book", "Book", null);
+      if (rawBook && typeof rawBook === "object" && !Array.isArray(rawBook)) {
+        responseShape = "nested-book";
+        returnedBookId = Number(source._value(rawBook, "id", "Id", NaN));
+        const rawChapters = source._value(
+          rawBook,
+          "chapters",
+          "Chapters",
+          null,
+        );
+        chaptersCount = Array.isArray(rawChapters) ? rawChapters.length : 0;
+      } else {
+        const rootId = Number(source._value(rawBookInfo, "id", "Id", NaN));
+        const rootChapters = source._value(
+          rawBookInfo,
+          "chapters",
+          "Chapters",
+          null,
+        );
+        if (Number.isSafeInteger(rootId) || Array.isArray(rootChapters)) {
+          responseShape = "root-book";
+          returnedBookId = rootId;
+          chaptersCount = Array.isArray(rootChapters)
+            ? rootChapters.length
+            : 0;
+        }
+      }
+    }
+    console.log(
+      `  ✓ GetBookInfo 安全形态诊断: shape=${responseShape}, 请求 Id=${resolvedBookId}, 返回 Id=${returnedBookId}, SeriesTitle=“${respSeriesTitle}”, Series数=${seriesCount}, 章节数=${chaptersCount}`,
+    );
+
     const details = await source.comic.loadInfo(targetTitle);
     if (!details || !details.title) {
       throw new Error("loadInfo 未返回有效漫画详情");
@@ -427,9 +515,12 @@ async function runSmoke() {
     }
     const [sampleChapterIdStr, sampleChapterTitle] = firstChapterEntries[0];
     const sampleChapterId = Number(sampleChapterIdStr);
-    console.log(`  ✓ GetBookInfo 成功, 标题: “${details.title}”, 分组数: ${chapterGroups.length}`);
-    console.log(`  ✓ 选定章节 [${sampleChapterIdStr}] “${sampleChapterTitle}” 用于后续只读测试`);
-
+    console.log(
+      `  ✓ loadInfo 详情解析成功, 标题: “${details.title}”, 分组数: ${chapterGroups.length}`,
+    );
+    console.log(
+      `  ✓ 选定章节 [${sampleChapterIdStr}] “${sampleChapterTitle}” 用于后续只读测试`,
+    );
     // 5. 测试 GetComicContent (只读第 1 批，验证 Chapter.Id 与 BookId 回填)
     console.log(`\n[5/8] 验证 GetComicContent (Cid: ${sampleChapterId})...`);
     const contentBatch = await source._loadComicContentBatch(targetTitle, sampleChapterId, 0);
