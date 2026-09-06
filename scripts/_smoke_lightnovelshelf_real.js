@@ -284,13 +284,25 @@ class MockComicSource {
   }
 }
 
+function toArrayBuffer(value) {
+  if (!value) return new ArrayBuffer(0);
+  if (value instanceof ArrayBuffer) {
+    return value.slice(0);
+  }
+  const view = ArrayBuffer.isView(value) ? value : Buffer.from(value);
+  return view.buffer.slice(
+    view.byteOffset,
+    view.byteOffset + view.byteLength,
+  );
+}
+
 const Convert = {
   encodeUtf8: (str) => Buffer.from(str, "utf8"),
   decodeUtf8: (buf) => Buffer.from(buf).toString("utf8"),
   hexEncode: (buf) => Buffer.from(buf).toString("hex"),
   sha256: (buf) => crypto.createHash("sha256").update(Buffer.from(buf)).digest(),
-  decodeBase64: (str) => Buffer.from(str, "base64"),
-  decodeGzip: (buf) => zlib.gunzipSync(Buffer.from(buf)),
+  decodeBase64: (str) => toArrayBuffer(Buffer.from(str, "base64")),
+  decodeGzip: (buf) => toArrayBuffer(zlib.gunzipSync(Buffer.from(buf))),
 };
 
 const createUuid = () => crypto.randomUUID();

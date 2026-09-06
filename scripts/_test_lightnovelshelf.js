@@ -66,6 +66,7 @@
  * 59. 打开 direct 相关书 book:<id> 不得改写 SeriesTitle 代表映射，旧标题收藏与记忆仍打开原代表 Book
  * 60. 宿主安全回归：latest/popular/history/search 宿主安全卡片与零搜索直连加载、旧标题恢复与 recommend 兼容
  * 61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）
+ * 62. 列表契约硬化：Base64 编码串/缺失 Data 拒绝、全无效条目抛错、混合有效条目过滤、合法空列表、无效总页数降级与 search/category 共享路径防御
  */
 
 const fs = require("node:fs");
@@ -73,6 +74,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const assert = require("node:assert");
 const crypto = require("node:crypto");
+const zlib = require("node:zlib");
 
 // 监听未处理 rejection，确保全套测试中零 unhandledRejection 逃逸
 const unhandledRejections = [];
@@ -192,6 +194,18 @@ class MockTimer {
   }
 }
 
+function toArrayBuffer(value) {
+  if (!value) return new ArrayBuffer(0);
+  if (value instanceof ArrayBuffer) {
+    return value.slice(0);
+  }
+  const view = ArrayBuffer.isView(value) ? value : Buffer.from(value);
+  return view.buffer.slice(
+    view.byteOffset,
+    view.byteOffset + view.byteLength,
+  );
+}
+
 function createSourceHarness(
   customNetwork = {},
   initialData = {},
@@ -260,8 +274,8 @@ function createSourceHarness(
     hexEncode: (buf) => Buffer.from(buf).toString("hex"),
     sha256: (buf) =>
       crypto.createHash("sha256").update(Buffer.from(buf)).digest(),
-    decodeBase64: (str) => Buffer.from(str, "base64"),
-    decodeGzip: (buf) => require("node:zlib").gunzipSync(Buffer.from(buf)),
+    decodeBase64: (str) => toArrayBuffer(Buffer.from(str, "base64")),
+    decodeGzip: (buf) => toArrayBuffer(zlib.gunzipSync(Buffer.from(buf))),
   };
 
   const createUuid = () => "01234567-89ab-cdef-0123-456789abcdef";
@@ -983,9 +997,9 @@ async function runTests() {
 
       // 为发现页的 3 个请求推送完成帧 (GetComicList latest, GetComicList view, GetReadHistory)
       s2.pushMessage(
-        `{"type":3,"invocationId":"${ids[0]}","result":{"success":true,"response":{"list":[],"total":0}}}\x1e` +
-          `{"type":3,"invocationId":"${ids[1]}","result":{"success":true,"response":{"list":[],"total":0}}}\x1e` +
-          `{"type":3,"invocationId":"${ids[2]}","result":{"success":true,"response":{"list":[]}}}\x1e`,
+        `{"type":3,"invocationId":"${ids[0]}","result":{"success":true,"response":{"Data":[],"TotalPages":1}}}\x1e` +
+          `{"type":3,"invocationId":"${ids[1]}","result":{"success":true,"response":{"Data":[],"TotalPages":1}}}\x1e` +
+          `{"type":3,"invocationId":"${ids[2]}","result":{"success":true,"response":{"Comic":[]}}}\x1e`,
       );
     };
 
@@ -1692,11 +1706,15 @@ async function runTests() {
   });
 
   await test("24. Gzip Hub 响应解码并在 invocation 中启用 UseGzip", async () => {
-    const { source } = createSourceHarness();
-    const payload = require("node:zlib").gzipSync(
+    const { source, sandbox } = createSourceHarness();
+    const payload = zlib.gzipSync(
       Buffer.from(JSON.stringify({ 中文: "正常" }), "utf8"),
     );
     const encoded = payload.toString("base64");
+    assert.strictEqual(
+      Object.prototype.toString.call(sandbox.Convert.decodeBase64(encoded)),
+      "[object ArrayBuffer]",
+    );
     assert.deepStrictEqual(
       JSON.parse(JSON.stringify(source._decodeHubResponse(encoded))),
       { 中文: "正常" },
@@ -2312,7 +2330,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.4.2");
+    assert.strictEqual(source.version, "0.4.3");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -3812,7 +3830,7 @@ async function runTests() {
     assert.strictEqual(searchCalled, false, "recommend 的 book:<id> 格式必须保持零搜索直接打开");
 
     // 5. 版本断言强一致
-    assert.strictEqual(source.version, "0.4.2");
+    assert.strictEqual(source.version, "0.4.3");
   });
 
   await test("61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）", async () => {
@@ -4028,6 +4046,143 @@ async function runTests() {
     }
     assert.ok(mismatchErr);
     assert.strictEqual(mismatchErr.isSeriesTitleMismatch, true);
+  });
+
+  await test("62. 列表契约硬化：Base64 编码串/缺失 Data 拒绝、全无效条目抛错、混合有效条目过滤、合法空列表、无效总页数降级与 search/category 共享路径防御", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. 编码字符串与缺失 Data 拒绝（防止协议失败静默变为空列表）
+    assert.throws(
+      () => source._comicListFromResponse("ZXhhbXBsZQ=="),
+      /轻书架漫画列表响应格式异常/,
+    );
+    assert.throws(
+      () => source._comicListFromResponse(null),
+      /轻书架漫画列表响应格式异常/,
+    );
+    assert.throws(
+      () => source._comicListFromResponse([]),
+      /轻书架漫画列表响应格式异常/,
+    );
+    assert.throws(
+      () => source._comicListFromResponse({ TotalPages: 5 }),
+      /轻书架漫画列表响应缺少 Data 数组/,
+    );
+    assert.throws(
+      () => source._comicListFromResponse({ Data: null, TotalPages: 1 }),
+      /轻书架漫画列表响应缺少 Data 数组/,
+    );
+    assert.throws(
+      () => source._comicListFromResponse({ Data: "invalid-string" }),
+      /轻书架漫画列表响应缺少 Data 数组/,
+    );
+
+    // 2. 全无效条目非空页坚决抛错并包含首个原因
+    const allInvalidData = {
+      Data: [
+        { Id: null, Title: "坏漫画-无ID" },
+        { Id: -1, Title: "坏漫画-负ID" },
+        { Id: 100, Title: "" },
+      ],
+      TotalPages: 3,
+    };
+    assert.throws(
+      () => source._comicListFromResponse(allInvalidData),
+      /轻书架列表返回 3 条记录，但全部解析失败: 无效漫画代表 Book\.Id: null/,
+    );
+
+    // 3. 混合有效与无效条目：跳过单项畸变记录并保留有效漫画
+    const mixedData = {
+      Data: [
+        { Id: null, Title: "坏漫画1" },
+        { Id: 501, Title: "正常漫画A", Count: 10 },
+        { Id: 502, Title: "" },
+        { Id: 503, Title: "正常漫画B", OriginalTitle: "原名B" },
+      ],
+      TotalPages: 4,
+    };
+    const mixedRes = source._comicListFromResponse(mixedData);
+    assert.strictEqual(mixedRes.comics.length, 2);
+    assert.strictEqual(mixedRes.comics[0].title, "正常漫画A");
+    assert.strictEqual(mixedRes.comics[0].id, "正常漫画A@@book:501");
+    assert.strictEqual(mixedRes.comics[1].title, "正常漫画B");
+    assert.strictEqual(mixedRes.comics[1].id, "正常漫画B@@book:503");
+    assert.strictEqual(mixedRes.maxPage, 4);
+
+    // 4. 合法空列表正常返回
+    const emptyRes = source._comicListFromResponse({ Data: [], TotalPages: 2 });
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(emptyRes.comics)), []);
+    assert.strictEqual(emptyRes.comics.length, 0);
+    assert.strictEqual(emptyRes.maxPage, 2);
+
+    // 5. TotalPages 接受数字字符串，非正整数安全降级为 1
+    const stringPageRes = source._comicListFromResponse({
+      Data: [{ Id: 601, Title: "有效漫画" }],
+      TotalPages: "5",
+    });
+    assert.strictEqual(stringPageRes.maxPage, 5, "合法数字字符串 TotalPages 必须被正确转换并接受");
+
+    for (const badPage of [0, -1, -5, "abc", null, undefined, 1.5, NaN, Infinity]) {
+      const res = source._comicListFromResponse({
+        Data: [{ Id: 601, Title: "有效漫画" }],
+        TotalPages: badPage,
+      });
+      assert.strictEqual(res.maxPage, 1, `TotalPages=${badPage} 必须降级为 1`);
+      assert.strictEqual(res.comics.length, 1);
+    }
+
+    // 6. search.load 与 categoryComics 共享路径防御与参数契约
+    let searchHubArgs = null;
+    source._hubCall = async (target, params, options) => {
+      searchHubArgs = { target, params, options };
+      return {
+        Data: [
+          { Id: "bad", Title: "坏项" },
+          { Id: 701, Title: "搜索结果漫", Count: 3 },
+        ],
+        TotalPages: "not-a-number",
+      };
+    };
+
+    const searchRes = await source.search.load("测试关键字", ["author"], 2);
+    assert.strictEqual(searchHubArgs.target, "SearchComicSeries");
+    assert.strictEqual(searchHubArgs.params.KeyWords, "测试关键字");
+    assert.strictEqual(searchHubArgs.params.Mode, "author");
+    assert.strictEqual(searchHubArgs.params.Page, 2);
+    assert.strictEqual(searchHubArgs.params.Size, 20);
+    assert.strictEqual(
+      searchHubArgs.options && searchHubArgs.options.retryTransport,
+      true,
+      "Search 必须启用 retryTransport: true",
+    );
+    assert.strictEqual(searchRes.comics.length, 1);
+    assert.strictEqual(searchRes.comics[0].id, "搜索结果漫@@book:701");
+    assert.strictEqual(searchRes.maxPage, 1, "非正整数字符串 TotalPages 必须降级为 1");
+
+    // 验证 search.load 在全无效时向外抛错而非吞掉变空列表
+    source._hubCall = async () => ({
+      Data: [{ Id: null, Title: "坏项" }],
+      TotalPages: 1,
+    });
+    let searchFailedErr = null;
+    try {
+      await source.search.load("测试", {}, 1);
+    } catch (err) {
+      searchFailedErr = err;
+    }
+    assert.ok(searchFailedErr, "全无效响应时 search.load 必须抛出错误");
+    assert.match(searchFailedErr.message, /轻书架列表返回 1 条记录，但全部解析失败/);
+
+    // 验证 categoryComics 在编码串（未解码协议异常）时向外抛错
+    source._hubCall = async () => "ZXhhbXBsZQ==";
+    let categoryFailedErr = null;
+    try {
+      await source.categoryComics.load("热门漫画", "view", null, 1);
+    } catch (err) {
+      categoryFailedErr = err;
+    }
+    assert.ok(categoryFailedErr, "编码字符串未解析时 categoryComics 必须抛错");
+    assert.match(categoryFailedErr.message, /轻书架漫画列表响应格式异常/);
   });
 
   assert.strictEqual(

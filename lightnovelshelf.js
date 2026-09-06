@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.4.2
+ * 版本：0.4.3
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -49,7 +49,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.4.2";
+  version = "0.4.3";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -1673,17 +1673,40 @@ class LightNovelShelf extends ComicSource {
   _decodeHubResponse(value) {
     if (typeof value !== "string") return value;
 
-    let bytes;
+    let rawBytes;
     try {
-      bytes = Convert.decodeBase64(value);
+      rawBytes = Convert.decodeBase64(value);
     } catch (_) {
       return value;
     }
+    if (!rawBytes) return value;
+
+    let view;
+    try {
+      if (rawBytes instanceof ArrayBuffer) {
+        view = new Uint8Array(rawBytes);
+      } else if (
+        typeof ArrayBuffer !== "undefined" &&
+        ArrayBuffer.isView &&
+        ArrayBuffer.isView(rawBytes)
+      ) {
+        view = new Uint8Array(
+          rawBytes.buffer,
+          rawBytes.byteOffset,
+          rawBytes.byteLength,
+        );
+      } else {
+        view = new Uint8Array(rawBytes);
+      }
+    } catch (_) {
+      return value;
+    }
+
     if (
-      !bytes ||
-      bytes.length < 2 ||
-      bytes[0] !== 0x1f ||
-      bytes[1] !== 0x8b
+      !view ||
+      view.length < 2 ||
+      view[0] !== 0x1f ||
+      view[1] !== 0x8b
     ) {
       return value;
     }
@@ -1692,9 +1715,15 @@ class LightNovelShelf extends ComicSource {
     }
 
     try {
-      return JSON.parse(Convert.decodeUtf8(Convert.decodeGzip(bytes)));
+      return JSON.parse(Convert.decodeUtf8(Convert.decodeGzip(rawBytes)));
     } catch (error) {
-      throw new Error("轻书架返回了无效的 Gzip 响应");
+      const reason =
+        error && error.message
+          ? `: ${error.message}`
+          : error
+            ? `: ${String(error)}`
+            : "";
+      throw new Error(`轻书架返回了无效的 Gzip 响应${reason}`);
     }
   }
 
@@ -3533,24 +3562,54 @@ class LightNovelShelf extends ComicSource {
   }
 
   _comicListFromResponse(data) {
-    const list = this._value(data, "data", "Data", []);
-    const totalPages = this._value(data, "totalPages", "TotalPages", 1);
-    const comics = [];
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new Error("轻书架漫画列表响应格式异常");
+    }
 
-    for (const item of Array.isArray(list) ? list : []) {
+    const list = this._value(data, "data", "Data");
+    if (!Array.isArray(list)) {
+      throw new Error("轻书架漫画列表响应缺少 Data 数组");
+    }
+
+    const rawTotalPages = Number(this._value(data, "totalPages", "TotalPages"));
+    const maxPage =
+      Number.isSafeInteger(rawTotalPages) && rawTotalPages > 0
+        ? rawTotalPages
+        : 1;
+
+    const comics = [];
+    let firstError = null;
+
+    for (const item of list) {
       try {
         const comic = this._comicFromListItem(item);
         if (comic && comic.id) {
           comics.push(comic);
+        } else if (!firstError) {
+          firstError = new Error("漫画条目无效或缺少 ID");
         }
-      } catch (_) {
-        // 单个畸变记录静默跳过，绝不导致整页白屏
+      } catch (err) {
+        if (!firstError) {
+          firstError = err;
+        }
       }
+    }
+
+    if (list.length > 0 && comics.length === 0) {
+      const reason =
+        firstError && firstError.message
+          ? firstError.message
+          : firstError
+            ? String(firstError)
+            : "未知原因";
+      throw new Error(
+        `轻书架列表返回 ${list.length} 条记录，但全部解析失败: ${reason}`,
+      );
     }
 
     return {
       comics: comics,
-      maxPage: Number(totalPages || 1),
+      maxPage: maxPage,
     };
   }
 
@@ -3998,34 +4057,20 @@ class LightNovelShelf extends ComicSource {
         ? selectedMode
         : "fuzzy";
 
-      const data = await this._hubCall("SearchComicSeries", {
-        KeyWords: keyword,
-        Mode: mode,
-        Page: page,
-        Size: 20,
-        IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
-        IgnoreAI: !!this.loadSetting("ignoreAI"),
-      });
+      const data = await this._hubCall(
+        "SearchComicSeries",
+        {
+          KeyWords: keyword,
+          Mode: mode,
+          Page: page,
+          Size: 20,
+          IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
+          IgnoreAI: !!this.loadSetting("ignoreAI"),
+        },
+        { retryTransport: true },
+      );
 
-      const list = this._value(data, "data", "Data", []);
-      const totalPages = this._value(data, "totalPages", "TotalPages", 1);
-
-      const comics = [];
-      for (const x of Array.isArray(list) ? list : []) {
-        try {
-          const comic = this._comicFromListItem(x);
-          if (comic && comic.id) {
-            comics.push(comic);
-          }
-        } catch (_) {
-          // 单个畸变记录跳过
-        }
-      }
-
-      return {
-        comics: comics,
-        maxPage: Number(totalPages || 1),
-      };
+      return this._comicListFromResponse(data);
     },
     optionList: [
       {
