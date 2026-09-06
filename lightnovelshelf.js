@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.3.2
+ * 版本：0.3.3
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -14,6 +14,8 @@
  * - 9 次/5.5 秒请求调度器 / Gzip 响应解码
  * - 漫画阅读进度单向同步（Venera → 轻书架）
  * - 新版 GetBookInfo 漫画详情 / 多上传版本章节聚合 / Book 评论与楼中楼回复
+ * - SeriesTitle->Book.Id 持久映射 / direct ID 直连与旧标题严格匹配恢复
+ * - 发现页多区块容错独立 settle / 正文 BookId 回填与阅读进度同步
  * - BookInfo TTL (60s) 缓存与容量淘汰 (64)
  * 使用前：
  * 1. 邮箱登录：在 Venera 账号区域输入轻书架邮箱和密码。
@@ -29,6 +31,7 @@ class LightNovelShelf extends ComicSource {
   static comicMetadataCacheLimit = 8;
   static bookInfoCacheLimit = 64;
   static bookInfoCacheTtlMs = 60 * 1000;
+  static seriesBookMapLimit = 256;
   static hubPingIntervalMs = 15000;
   static hubInvocationTimeoutMs = 30000;
   static hubConnectTimeoutMs = 30000;
@@ -43,7 +46,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.3.2";
+  version = "0.3.3";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -1829,7 +1832,10 @@ class LightNovelShelf extends ComicSource {
     });
 
     for (const promise of promises) promise.catch(() => {});
-    const batchPromise = Promise.all(promises);
+    const batchPromise =
+      options.settled === true
+        ? Promise.allSettled(promises)
+        : Promise.all(promises);
     batchPromise.catch(() => {});
     const payload = invocations.map((item) => item.message).join("");
 
@@ -2188,11 +2194,32 @@ class LightNovelShelf extends ComicSource {
     return null;
   }
 
-  _comicContentBatchFromResponse(data, requestedSkip) {
+  _comicContentBatchFromResponse(data, requestedSkip, requestedChapterId) {
     const chapter = this._value(data, "chapter", "Chapter", null);
     if (!chapter || typeof chapter !== "object") {
       throw new Error("GetComicContent 未返回 chapter/Chapter");
     }
+
+    if (requestedChapterId !== undefined && requestedChapterId !== null) {
+      const responseChapterId = this._comicChapterId(
+        this._value(chapter, "id", "Id", null),
+      );
+      if (
+        responseChapterId === null ||
+        responseChapterId !== requestedChapterId
+      ) {
+        throw new Error(
+          `章节 ID 不匹配: 请求 ${requestedChapterId}，响应 ${responseChapterId}`,
+        );
+      }
+    }
+
+    const rawBookId = this._value(chapter, "bookId", "BookId", null);
+    const parsedBookId = Number(rawBookId);
+    const validBookId =
+      Number.isSafeInteger(parsedBookId) && parsedBookId > 0
+        ? parsedBookId
+        : null;
 
     const imagesRaw = this._value(chapter, "images", "Images", null);
     const total = Number(this._value(chapter, "total", "Total", NaN));
@@ -2234,7 +2261,12 @@ class LightNovelShelf extends ComicSource {
       }
       return this._normalizeUrl(image.trim());
     });
-    return { skip: requestedSkip, total: total, images: images };
+    return {
+      skip: requestedSkip,
+      total: total,
+      images: images,
+      bookId: validBookId,
+    };
   }
 
   async _loadComicContentBatch(comicId, chapterId, skip) {
@@ -2259,7 +2291,25 @@ class LightNovelShelf extends ComicSource {
       ) {
         throw new Error("轻书架章节图片请求已失效");
       }
-      const batch = this._comicContentBatchFromResponse(data, skip);
+      const batch = this._comicContentBatchFromResponse(data, skip, chapterId);
+      if (batch.bookId !== null) {
+        const bookKey = this._comicChapterBookIdKey(
+          comicId,
+          chapterId,
+          state.apiBase,
+          state.authGeneration,
+        );
+        this._comicChapterBookIds.set(bookKey, batch.bookId);
+        const metaKey = this._comicMetadataCacheKey(
+          comicId,
+          state.apiBase,
+          state.authGeneration,
+        );
+        const meta = this._comicMetadataKeys.get(metaKey);
+        if (meta) {
+          meta.bookKeys.add(bookKey);
+        }
+      }
       if (state.total !== null && state.total !== batch.total) {
         throw new Error(
           `章节总页数发生变化: 原 ${state.total} 页，现 ${batch.total} 页`,
@@ -2327,6 +2377,102 @@ class LightNovelShelf extends ComicSource {
     return `${apiBase}\n${authGeneration}\n${String(seriesTitle)}`;
   }
 
+  _seriesBookMapStorageKey(apiBase = this.apiBase) {
+    return `seriesBookMap:${apiBase}`;
+  }
+
+  _getPersistentSeriesBookMap(apiBase = this.apiBase) {
+    const raw = this.loadData(this._seriesBookMapStorageKey(apiBase));
+    if (!raw) return new Map();
+    let parsed = raw;
+    if (typeof raw === "string") {
+      try {
+        parsed = JSON.parse(raw);
+      } catch (_e) {
+        return new Map();
+      }
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return new Map();
+    }
+    const map = new Map();
+    if (Array.isArray(parsed)) {
+      for (const entry of parsed) {
+        if (Array.isArray(entry) && entry.length >= 2) {
+          const title = String(entry[0] == null ? "" : entry[0]).trim();
+          const id = Number(entry[1]);
+          if (title && Number.isSafeInteger(id) && id > 0) {
+            map.set(title, id);
+          }
+        } else if (entry && typeof entry === "object") {
+          const title = String(
+            this._value(entry, "title", "Title", "") || "",
+          ).trim();
+          const id = Number(this._value(entry, "id", "Id", NaN));
+          if (title && Number.isSafeInteger(id) && id > 0) {
+            map.set(title, id);
+          }
+        }
+      }
+    } else {
+      for (const [key, val] of Object.entries(parsed)) {
+        const title = String(key == null ? "" : key).trim();
+        const id = Number(val);
+        if (title && Number.isSafeInteger(id) && id > 0) {
+          map.set(title, id);
+        }
+      }
+    }
+    return map;
+  }
+
+  _savePersistentSeriesBookMap(map, apiBase = this.apiBase) {
+    while (map.size > this.constructor.seriesBookMapLimit) {
+      const oldest = map.keys().next().value;
+      map.delete(oldest);
+    }
+    const obj = Object.create(null);
+    for (const [title, id] of map) {
+      obj[title] = id;
+    }
+    this.saveData(this._seriesBookMapStorageKey(apiBase), JSON.stringify(obj));
+  }
+
+  _getPersistentSeriesBookId(title, apiBase = this.apiBase) {
+    const normalizedTitle = String(title == null ? "" : title).trim();
+    if (!normalizedTitle) return null;
+    const map = this._getPersistentSeriesBookMap(apiBase);
+    const id = map.get(normalizedTitle);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+  }
+
+  _setPersistentSeriesBookId(title, bookId, apiBase = this.apiBase) {
+    const normalizedTitle = String(title == null ? "" : title).trim();
+    const normalizedId = Number(bookId);
+    if (
+      !normalizedTitle ||
+      !Number.isSafeInteger(normalizedId) ||
+      normalizedId <= 0
+    ) {
+      return;
+    }
+    const map = this._getPersistentSeriesBookMap(apiBase);
+    if (map.has(normalizedTitle)) {
+      map.delete(normalizedTitle);
+    }
+    map.set(normalizedTitle, normalizedId);
+    this._savePersistentSeriesBookMap(map, apiBase);
+  }
+
+  _parseDirectBookId(id) {
+    const raw = String(id == null ? "" : id).trim();
+    if (!raw) return null;
+    const match = raw.match(/^(?:book:)?([1-9]\d*)$/i);
+    if (!match) return null;
+    const parsed = Number(match[1]);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+  }
+
   _rememberRepresentativeBookId(
     seriesTitle,
     bookId,
@@ -2334,7 +2480,7 @@ class LightNovelShelf extends ComicSource {
     authGeneration = this._authGeneration,
   ) {
     const normalizedId = Number(bookId);
-    const title = String(seriesTitle == null ? "" : seriesTitle);
+    const title = String(seriesTitle == null ? "" : seriesTitle).trim();
     if (
       !title ||
       !Number.isSafeInteger(normalizedId) ||
@@ -2346,6 +2492,7 @@ class LightNovelShelf extends ComicSource {
       this._seriesCacheKey(title, apiBase, authGeneration),
       normalizedId,
     );
+    this._setPersistentSeriesBookId(title, normalizedId, apiBase);
   }
 
   _rememberSeriesListMetadata(
@@ -2353,7 +2500,7 @@ class LightNovelShelf extends ComicSource {
     apiBase = this.apiBase,
     authGeneration = this._authGeneration,
   ) {
-    const title = String(this._value(item, "title", "Title", "") || "");
+    const title = String(this._value(item, "title", "Title", "") || "").trim();
     if (!title) return;
     const representativeBookId = Number(
       this._value(item, "id", "Id", NaN),
@@ -2381,12 +2528,24 @@ class LightNovelShelf extends ComicSource {
     );
   }
 
-  _resolveRepresentativeBookId(seriesTitle) {
-    const title = String(seriesTitle);
+  async _resolveRepresentativeBookId(seriesTitle) {
+    const directId = this._parseDirectBookId(seriesTitle);
+    if (directId !== null) {
+      return directId;
+    }
+    const title = String(seriesTitle == null ? "" : seriesTitle).trim();
+    if (!title) {
+      throw new Error("无效漫画标识");
+    }
     const key = this._seriesCacheKey(title);
     const cached = this._seriesRepresentativeBookIds.get(key);
     if (Number.isSafeInteger(cached) && cached > 0) {
-      return Promise.resolve(cached);
+      return cached;
+    }
+    const persistentId = this._getPersistentSeriesBookId(title);
+    if (Number.isSafeInteger(persistentId) && persistentId > 0) {
+      this._rememberRepresentativeBookId(title, persistentId);
+      return persistentId;
     }
     const pendingKey = `${key}\nresolve`;
     const pending = this._seriesLoadPromises.get(pendingKey);
@@ -2404,23 +2563,31 @@ class LightNovelShelf extends ComicSource {
   }
 
   async _resolveRepresentativeBookIdFromSearch(title, key) {
-    const data = await this._hubCall(
-      "SearchComicSeries",
-      {
-        KeyWords: title,
-        Mode: "name",
-        Page: 1,
-        Size: 20,
-        IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
-        IgnoreAI: !!this.loadSetting("ignoreAI"),
-      },
-      { retryTransport: true },
-    );
-    const items = this._value(data, "data", "Data", []);
-    const match = (Array.isArray(items) ? items : []).find(
-      (item) =>
-        String(this._value(item, "title", "Title", "")) === title,
-    );
+    const searchInMode = async (mode) => {
+      const data = await this._hubCall(
+        "SearchComicSeries",
+        {
+          KeyWords: title,
+          Mode: mode,
+          Page: 1,
+          Size: 20,
+          IgnoreJapanese: !!this.loadSetting("ignoreJapanese"),
+          IgnoreAI: !!this.loadSetting("ignoreAI"),
+        },
+        { retryTransport: true },
+      );
+      const items = this._value(data, "data", "Data", []);
+      return (Array.isArray(items) ? items : []).find(
+        (item) =>
+          String(this._value(item, "title", "Title", "") || "").trim() ===
+          title,
+      );
+    };
+
+    let match = await searchInMode("exact");
+    if (!match) {
+      match = await searchInMode("fuzzy");
+    }
     if (!match) {
       throw new Error(`无法解析漫画“${title}”对应的 Book.Id`);
     }
@@ -2513,7 +2680,11 @@ class LightNovelShelf extends ComicSource {
     return result;
   }
 
-  async _loadSeriesBookDetails(seriesTitle, representativeBookId) {
+  async _loadSeriesBookDetails(
+    seriesTitle,
+    representativeBookId,
+    isDirectId = false,
+  ) {
     const primaryData = await this._getBookInfo(representativeBookId);
     const primaryBook = this._value(primaryData, "book", "Book", null);
     if (!primaryBook || typeof primaryBook !== "object") {
@@ -2542,10 +2713,9 @@ class LightNovelShelf extends ComicSource {
       ) || seriesTitle,
     );
     this._rememberRepresentativeBookId(resolvedSeriesTitle, primaryBookId);
-    if (resolvedSeriesTitle !== String(seriesTitle)) {
+    if (!isDirectId && resolvedSeriesTitle !== String(seriesTitle)) {
       throw new Error("GetBookInfo 返回的 SeriesTitle 与请求不一致");
     }
-
     const bookIds = this._extractSeriesBookIds(primaryData, primaryBookId);
     const secondaryIds = bookIds.filter((id) => id !== primaryBookId);
     const settled = await Promise.allSettled(
@@ -2576,15 +2746,15 @@ class LightNovelShelf extends ComicSource {
     };
   }
 
-  _loadSeriesDetails(seriesTitle, representativeBookId) {
+  _loadSeriesDetails(seriesTitle, representativeBookId, isDirectId = false) {
     const key = this._seriesCacheKey(seriesTitle);
     const pending = this._seriesLoadPromises.get(key);
     if (pending) return pending;
     const request = this._loadSeriesBookDetails(
       seriesTitle,
       representativeBookId,
+      isDirectId,
     );
-    this._seriesLoadPromises.set(key, request);
     const clear = () => {
       if (this._seriesLoadPromises.get(key) === request) {
         this._seriesLoadPromises.delete(key);
@@ -2702,11 +2872,11 @@ class LightNovelShelf extends ComicSource {
       // 保持 SeriesTitle 作为 Venera comicId；内部详情和评论使用缓存的 Book.Id。
       id: String(title),
       title: String(title),
-      subTitle: original || (count ? `${count} 本` : ""),
+      subTitle: original || (count ? `${count} 话` : ""),
       cover: this._normalizeUrl(cover),
       tags: [],
       description: [
-        count ? `共 ${count} 本` : "",
+        count ? `共 ${count} 话` : "",
         updated ? `更新: ${updated}` : "",
       ]
         .filter(Boolean)
@@ -2954,7 +3124,7 @@ class LightNovelShelf extends ComicSource {
     const loaded = await this._runHubSession(
       "LoadDiscovery",
       async (session) => {
-        const [latestData, popularData, historyData] =
+        const [latestResult, popularResult, historyResult] =
           await this._hubInvokeBatch(
             session,
             [
@@ -2978,30 +3148,53 @@ class LightNovelShelf extends ComicSource {
               },
               { target: "GetReadHistory", params: {}, retryTransport: true },
             ],
-            { retryTransport: true },
+            { retryTransport: true, settled: true },
           );
 
         assertCurrentRequest();
-        const historyIds = this._historyIdsFromResponse(historyData);
-        const pageIds = historyIds.slice(
-          0,
-          LightNovelShelf.discoveryPageSize,
-        );
+        const isLatestOk = latestResult && latestResult.status === "fulfilled";
+        const isPopularOk =
+          popularResult && popularResult.status === "fulfilled";
+        const isHistoryOk =
+          historyResult && historyResult.status === "fulfilled";
+
+        if (!isLatestOk && !isPopularOk && !isHistoryOk) {
+          const firstError =
+            (latestResult && latestResult.reason) ||
+            (popularResult && popularResult.reason) ||
+            (historyResult && historyResult.reason) ||
+            new Error("发现页全部首层请求均失败");
+          throw firstError;
+        }
+
+        let historyIds = [];
         let historyDetails = null;
 
-        if (pageIds.length > 0) {
-          historyDetails = await this._hubInvoke(
-            session,
-            "GetBookListByIds",
-            { Ids: pageIds, Type: "Comic" },
-            { retryTransport: true },
+        if (isHistoryOk) {
+          historyIds = this._historyIdsFromResponse(historyResult.value);
+          const pageIds = historyIds.slice(
+            0,
+            LightNovelShelf.discoveryPageSize,
           );
-          assertCurrentRequest();
+          if (pageIds.length > 0) {
+            try {
+              historyDetails = await this._hubInvoke(
+                session,
+                "GetBookListByIds",
+                { Ids: pageIds, Type: "Comic" },
+                { retryTransport: true },
+              );
+              assertCurrentRequest();
+            } catch (_detailsErr) {
+              // 历史详情失败只清空历史
+              historyDetails = null;
+            }
+          }
         }
 
         return {
-          latestData: latestData,
-          popularData: popularData,
+          latestData: isLatestOk ? latestResult.value : null,
+          popularData: isPopularOk ? popularResult.value : null,
           historyIds: historyIds,
           historyDetails: historyDetails,
         };
@@ -3011,8 +3204,12 @@ class LightNovelShelf extends ComicSource {
 
     assertCurrentRequest();
     const seenSeries = new Set();
-    const latest = this._comicListFromResponse(loaded.latestData);
-    const popular = this._comicListFromResponse(loaded.popularData);
+    const latest = loaded.latestData
+      ? this._comicListFromResponse(loaded.latestData)
+      : { comics: [], maxPage: 1 };
+    const popular = loaded.popularData
+      ? this._comicListFromResponse(loaded.popularData)
+      : { comics: [], maxPage: 1 };
     const historyComics = loaded.historyDetails
       ? this._historyComicsFromResponse(
           loaded.historyDetails,
@@ -3156,16 +3353,21 @@ class LightNovelShelf extends ComicSource {
 
   comic = {
     loadInfo: async (id) => {
-      const seriesTitle = String(id);
+      const directBookId = this._parseDirectBookId(id);
+      const isDirectId = directBookId !== null;
       const apiBase = this.apiBase;
       const authGeneration = this._authGeneration;
-      const representativeBookId =
-        await this._resolveRepresentativeBookId(seriesTitle);
+      const representativeBookId = isDirectId
+        ? directBookId
+        : await this._resolveRepresentativeBookId(id);
       const details = await this._loadSeriesDetails(
-        seriesTitle,
+        id,
         representativeBookId,
+        isDirectId,
       );
-      const books = details.books;
+      const books = Array.isArray(details.books) ? details.books : [];
+      const seriesTitle = details.seriesTitle || String(id);
+      const targetComicId = String(id);
       const metadata = this._seriesListMetadata.get(
         this._seriesCacheKey(seriesTitle, apiBase, authGeneration),
       );
@@ -3235,7 +3437,7 @@ class LightNovelShelf extends ComicSource {
           if (Number.isSafeInteger(pageCount) && pageCount >= 0) {
             chapterPageCounts.set(
               this._comicContentStateKey(
-                seriesTitle,
+                targetComicId,
                 chapterId,
                 apiBase,
                 authGeneration,
@@ -3245,7 +3447,7 @@ class LightNovelShelf extends ComicSource {
           }
           chapterBookIds.set(
             this._comicChapterBookIdKey(
-              seriesTitle,
+              targetComicId,
               chapterId,
               apiBase,
               authGeneration,
@@ -3329,7 +3531,7 @@ class LightNovelShelf extends ComicSource {
 
       if (apiBase === this.apiBase && authGeneration === this._authGeneration) {
         this._mergeComicMetadataCache(
-          seriesTitle,
+          targetComicId,
           chapterBookIds,
           chapterPageCounts,
           apiBase,

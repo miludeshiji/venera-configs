@@ -44,6 +44,14 @@
  * 37. 漫画源基础元数据有效且与 index.json 保持强一致
  * 38. BookInfo PageCount 更新后失效旧正文 total 与 batch
  * 39. 详情更新时间取列表和 Book 的最新候选值
+ * 40. 跨实例通过持久映射恢复 Book.Id 并完全跳过搜索
+ * 41. 持久映射损坏安全降级、容量 256 淘汰与 apiBase 线路隔离
+ * 42. 漫画标题搜索解析 exact 优先与 fuzzy 严格相等回退
+ * 43. fuzzy 搜索结果拒绝相似项且不盲信首项
+ * 44. book:<正整数> 与纯数字 direct ID 直连跳过搜索且消除一致性冲突
+ * 45. 发现页首层多区块独立 settle、局部失败容错与全部失败抛错
+ * 46. 正文 GetComicContent 校验 Chapter.Id 并回填 BookId 支持 SaveReadPosition
+ * 47. Count 文案在列表与描述中严格规范为“话”
  */
 
 const fs = require("node:fs");
@@ -170,22 +178,34 @@ class MockTimer {
   }
 }
 
-function createSourceHarness(customNetwork = {}, initialData = {}) {
-  const dataStore = new Map([
-    [
-      "account",
-      JSON.stringify({
-        email: "tester@example.com",
-        password: "mockpassword",
-      }),
-    ],
-    ["refreshToken", "mock-refresh-token-12345"],
-    ["visitorId", "0123456789abcdef0123456789abcdef"],
-    ...Object.entries(initialData),
-  ]);
-  const settingsStore = new Map([
-    ["apiServer", "https://api.lightnovel.life"],
-  ]);
+function createSourceHarness(
+  customNetwork = {},
+  initialData = {},
+  harnessOptions = {},
+) {
+  let dataStore;
+  if (harnessOptions && harnessOptions.dataStore instanceof Map) {
+    dataStore = harnessOptions.dataStore;
+  } else if (initialData instanceof Map) {
+    dataStore = initialData;
+  } else {
+    dataStore = new Map([
+      [
+        "account",
+        JSON.stringify({
+          email: "tester@example.com",
+          password: "mockpassword",
+        }),
+      ],
+      ["refreshToken", "mock-refresh-token-12345"],
+      ["visitorId", "0123456789abcdef0123456789abcdef"],
+      ...Object.entries(initialData || {}),
+    ]);
+  }
+  const settingsStore =
+    harnessOptions && harnessOptions.settingsStore instanceof Map
+      ? harnessOptions.settingsStore
+      : new Map([["apiServer", "https://api.lightnovel.life"]]);
 
   class MockComicSource {
     name = "";
@@ -2201,7 +2221,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.3.2");
+    assert.strictEqual(source.version, "0.3.3");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -2250,6 +2270,8 @@ async function runTests() {
         if (target === "GetComicContent") {
           return {
             Chapter: {
+              Id: 1001,
+              BookId: 100,
               Total: 6,
               Skip: params.Skip || 0,
               Images: [
@@ -2352,6 +2374,372 @@ async function runTests() {
 
     const detailsB = await source.comic.loadInfo("Series B");
     assert.strictEqual(detailsB.updateTime, "2026-09-06T00:00:00Z");
+  });
+  await test("40. 跨实例通过持久映射恢复 Book.Id 并完全跳过搜索", async () => {
+    const { source: source1, dataStore } = createSourceHarness();
+    source1._comicFromListItem({ Id: 888, Title: "跨实例漫画" });
+
+    const key = source1._seriesBookMapStorageKey();
+    assert.strictEqual(dataStore.has(key), true);
+
+    const { source: source2 } = createSourceHarness({}, {}, { dataStore });
+    assert.strictEqual(source2._seriesRepresentativeBookIds.size, 0);
+
+    let searchCalled = false;
+    let getBookInfoCalled = false;
+    source2._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searchCalled = true;
+        throw new Error("持久映射命中时不应发起搜索！");
+      }
+      if (target === "GetBookInfo") {
+        getBookInfoCalled = true;
+        assert.strictEqual(params.Id, 888);
+        return {
+          SeriesTitle: "跨实例漫画",
+          Series: [{ Id: 888, Title: "跨实例漫画", Cover: "" }],
+          Book: {
+            Id: 888,
+            Type: "Comic",
+            Title: "跨实例漫画",
+            Cover: "",
+            Author: "",
+            Introduction: "",
+            User: { UserName: "U" },
+            Chapters: [{ Id: 101, Title: "第 1 话", PageCount: 1 }],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const details = await source2.comic.loadInfo("跨实例漫画");
+    assert.strictEqual(searchCalled, false, "必须完全跳过搜索");
+    assert.strictEqual(getBookInfoCalled, true);
+    assert.strictEqual(details.title, "跨实例漫画");
+    assert.strictEqual(details.subId, "888");
+  });
+
+  await test("41. 持久映射损坏安全降级、容量 256 淘汰与 apiBase 线路隔离", async () => {
+    const { source, dataStore, settingsStore } = createSourceHarness();
+    const storageKey = source._seriesBookMapStorageKey();
+
+    // 1. 损坏数据安全降级
+    dataStore.set(storageKey, "{bad json--!!");
+    assert.strictEqual(source._getPersistentSeriesBookId("TestTitle"), null);
+    source._setPersistentSeriesBookId("TitleValid", 100);
+    assert.strictEqual(source._getPersistentSeriesBookId("TitleValid"), 100);
+
+    // 2. 容量 256 限制与 LRU 淘汰
+    for (let i = 1; i <= 260; i++) {
+      source._setPersistentSeriesBookId(`Comic ${i}`, i);
+    }
+    const map = source._getPersistentSeriesBookMap();
+    assert.strictEqual(map.size, 256, "持久映射容量不得超过 256 条");
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 1"), null, "最早加入的条目应被驱逐");
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 4"), null);
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 5"), 5);
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 260"), 260);
+
+    // 3. apiBase 分桶隔离
+    settingsStore.set("apiServer", "https://alt-api.lightnovel.life");
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 260"), null, "不同 apiBase 必须相互隔离");
+    source._setPersistentSeriesBookId("AltComic", 999);
+    assert.strictEqual(source._getPersistentSeriesBookId("AltComic"), 999);
+
+    settingsStore.set("apiServer", "https://api.lightnovel.life");
+    assert.strictEqual(source._getPersistentSeriesBookId("AltComic"), null);
+    assert.strictEqual(source._getPersistentSeriesBookId("Comic 260"), 260);
+  });
+
+  await test("42. 漫画标题搜索解析 exact 优先与 fuzzy 严格相等回退", async () => {
+    const { source } = createSourceHarness();
+
+    // 场景 1: exact 搜索直接命中严格相等的 Title
+    const searchModesCalled = [];
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searchModesCalled.push(params.Mode);
+        if (params.Mode === "exact") {
+          return {
+            Data: [{ Id: 101, Title: "精确漫画" }],
+          };
+        }
+        return { Data: [] };
+      }
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "精确漫画",
+          Series: [{ Id: 101, Title: "精确漫画" }],
+          Book: {
+            Id: 101,
+            Type: "Comic",
+            Title: "精确漫画",
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const id1 = await source._resolveRepresentativeBookId("精确漫画");
+    assert.strictEqual(id1, 101);
+    assert.deepStrictEqual(searchModesCalled, ["exact"], "exact 命中时不得触发 fuzzy");
+
+    // 场景 2: exact 搜索未命中，回退至 fuzzy 搜索
+    source._clearComicContentStates();
+    const searchModesCalled2 = [];
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searchModesCalled2.push(params.Mode);
+        if (params.Mode === "exact") {
+          return { Data: [] };
+        }
+        if (params.Mode === "fuzzy") {
+          return {
+            Data: [{ Id: 202, Title: "回退漫画" }],
+          };
+        }
+      }
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "回退漫画",
+          Series: [{ Id: 202, Title: "回退漫画" }],
+          Book: {
+            Id: 202,
+            Type: "Comic",
+            Title: "回退漫画",
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const id2 = await source._resolveRepresentativeBookId("回退漫画");
+    assert.strictEqual(id2, 202);
+    assert.deepStrictEqual(searchModesCalled2, ["exact", "fuzzy"], "exact 失败后应回退 fuzzy");
+  });
+
+  await test("43. fuzzy 搜索结果拒绝相似项且不盲信首项", async () => {
+    const { source } = createSourceHarness();
+
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        if (params.Mode === "exact") return { Data: [] };
+        if (params.Mode === "fuzzy") {
+          return {
+            Data: [
+              { Id: 999, Title: "目标漫画 (特别篇)" },
+              { Id: 888, Title: "目标漫画 第二季" },
+            ],
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    let caughtErr = null;
+    try {
+      await source._resolveRepresentativeBookId("目标漫画");
+    } catch (e) {
+      caughtErr = e;
+    }
+    assert.ok(caughtErr, "找不到严格相等的 Title 时必须抛出错误，严禁直接使用第 1 项");
+    assert.match(caughtErr.message, /无法解析漫画“目标漫画”对应的 Book.Id/);
+  });
+
+  await test("44. book:<正整数> 与纯数字 direct ID 直连跳过搜索且消除一致性冲突", async () => {
+    const { source } = createSourceHarness();
+
+    let searchCalled = false;
+    const requestedBookIds = [];
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        searchCalled = true;
+        throw new Error("direct ID 不得发起搜索");
+      }
+      if (target === "GetBookInfo") {
+        requestedBookIds.push(params.Id);
+        return {
+          SeriesTitle: "真实漫画标题",
+          Series: [{ Id: params.Id, Title: "真实漫画标题" }],
+          Book: {
+            Id: params.Id,
+            Type: "Comic",
+            Title: "真实漫画标题",
+            Chapters: [
+              { Id: 5001, SortNum: 1, Title: "第 1 话", PageCount: 5 },
+            ],
+          },
+        };
+      }
+      if (target === "SaveReadPosition") {
+        return null;
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 1. 支持 book:777 格式
+    const detailsA = await source.comic.loadInfo("book:777");
+    assert.strictEqual(searchCalled, false);
+    assert.strictEqual(detailsA.title, "真实漫画标题");
+    assert.strictEqual(detailsA.subId, "777");
+
+    // 2. 支持纯数字 888 格式
+    const detailsB = await source.comic.loadInfo("888");
+    assert.strictEqual(detailsB.title, "真实漫画标题");
+    assert.strictEqual(detailsB.subId, "888");
+
+    assert.deepStrictEqual(requestedBookIds, [777, 888]);
+
+    // 3. 验证 direct ID 独立缓存有效，两套 ID 互不干扰与淘汰
+    assert.strictEqual(source._knownComicPageCount("book:777", 5001), 5);
+    assert.strictEqual(source._knownComicPageCount("888", 5001), 5);
+  });
+
+  await test("45. 发现页首层多区块独立 settle、局部失败容错与全部失败抛错", async () => {
+    const { source } = createSourceHarness();
+
+    // 场景 1: 局部失败容错 (latest 成功, view 失败, history 成功但 GetBookListByIds 失败)
+    source._hubCall = async (target, params) => {
+      throw new Error("discovery partial error");
+    };
+
+    source._runHubSession = async (op, fn, options) => {
+      const mockSession = {};
+      return await fn(mockSession);
+    };
+
+    source._hubInvokeBatch = async (session, calls, options) => {
+      if (options && options.settled) {
+        return [
+          {
+            status: "fulfilled",
+            value: {
+              Data: [{ Id: 10, Title: "Latest Comic", Count: 1 }],
+              TotalPages: 1,
+            },
+          },
+          {
+            status: "rejected",
+            reason: new Error("Popular section unavailable"),
+          },
+          {
+            status: "fulfilled",
+            value: {
+              Comic: [100, 200],
+            },
+          },
+        ];
+      }
+      throw new Error("unexpected batch invoke");
+    };
+
+    source._hubInvoke = async (session, target, params) => {
+      if (target === "GetBookListByIds") {
+        throw new Error("History details failed");
+      }
+      throw new Error(`Unexpected invoke: ${target}`);
+    };
+
+    const parts = await source._loadDiscoveryPage();
+    assert.strictEqual(parts.length, 3);
+    assert.strictEqual(parts[0].comics.length, 1);
+    assert.strictEqual(parts[0].comics[0].title, "Latest Comic");
+    assert.strictEqual(parts[1].comics.length, 0, "view 失败时对应区块返回空");
+    assert.strictEqual(parts[2].comics.length, 0, "history 详情失败时只清空历史区块");
+
+    // 场景 2: 全部首层请求均失败时必须抛错
+    source._clearComicContentStates();
+    source._hubInvokeBatch = async (session, calls, options) => {
+      return [
+        { status: "rejected", reason: new Error("Latest failed") },
+        { status: "rejected", reason: new Error("Popular failed") },
+        { status: "rejected", reason: new Error("History failed") },
+      ];
+    };
+
+    let allFailedErr = null;
+    try {
+      await source._loadDiscoveryPage();
+    } catch (e) {
+      allFailedErr = e;
+    }
+    assert.ok(allFailedErr, "全部首层请求均失败时必须抛出错误");
+  });
+
+  await test("46. 正文 GetComicContent 校验 Chapter.Id 并回填 BookId 支持 SaveReadPosition", async () => {
+    const { source } = createSourceHarness();
+
+    const savedProgress = [];
+    source._hubCall = async (target, params) => {
+      if (target === "GetComicContent") {
+        if (params.Cid === 9999) {
+          return {
+            Chapter: {
+              Id: 8888,
+              BookId: 200,
+              Total: 6,
+              Skip: 0,
+              Images: ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg", "6.jpg"],
+            },
+          };
+        }
+        return {
+          Chapter: {
+            Id: params.Cid,
+            BookId: 300,
+            Total: 6,
+            Skip: 0,
+            Images: ["1.jpg", "2.jpg", "3.jpg", "4.jpg", "5.jpg", "6.jpg"],
+          },
+        };
+      }
+      if (target === "SaveReadPosition") {
+        savedProgress.push(params);
+        return null;
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 1. Chapter.Id 不匹配时坚决抛错
+    let mismatchErr = null;
+    try {
+      await source._loadComicContentBatch("DirectComic", 9999, 0);
+    } catch (e) {
+      mismatchErr = e;
+    }
+    assert.ok(mismatchErr, "Chapter.Id 与请求不一致时必须报错");
+    assert.match(mismatchErr.message, /章节 ID 不匹配/);
+
+    // 2. 未执行 loadInfo，直接从正文加载 Chapter，自动回填 BookId
+    const batch = await source._loadComicContentBatch("DirectComic", 7001, 0);
+    assert.strictEqual(batch.images.length, 6);
+    assert.strictEqual(batch.bookId, 300);
+
+    // 3. 执行 updateReadProgress 能够成功调用 SaveReadPosition 并带上回填的 BookId
+    await source.comic.updateReadProgress("DirectComic", "7001", 3);
+    assert.strictEqual(savedProgress.length, 1);
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(savedProgress[0])), {
+      Bid: 300,
+      Cid: 7001,
+      XPath: "3",
+    });
+  });
+
+  await test("47. Count 文案在列表与描述中严格规范为“话”", async () => {
+    const { source } = createSourceHarness();
+
+    const comicItem = source._comicFromListItem({
+      Id: 123,
+      Title: "测试漫画",
+      Count: 25,
+      LastUpdatedAt: "2026-09-06",
+    });
+
+    assert.strictEqual(comicItem.subTitle, "25 话");
+    assert.strictEqual(comicItem.description, "共 25 话 · 更新: 2026-09-06");
   });
 
   assert.strictEqual(
