@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.3.5
+ * 版本：0.4.0
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -13,7 +13,7 @@
  * - 后台预连接 / WebSocket 长期连接与自动重连 / 单连接批量发现页（12 项）/ 24 项分类分页
  * - 9 次/5.5 秒请求调度器 / Gzip 响应解码
  * - 漫画阅读进度单向同步（Venera → 轻书架）
- * - 新版 GetBookInfo 漫画详情（兼容 nested/root-level Book 契约与安全诊断） / 多上传版本章节聚合 / Book 评论与楼中楼回复
+ * - 新版 GetBookInfo 单书漫画详情（每个 Book.Id 独立、同系列其他书位于详情“相关”、单层章节不跨书合并） / Book 评论与楼中楼回复
  * - 稳定 book:<id> 漫画身份模型 / 旧 SeriesTitle 通过官方历史与有界搜索安全恢复 / direct ID 直连跳过搜索
  * - 发现页多区块容错独立 settle / 正文 BookId 回填与阅读进度同步
  * - BookInfo TTL (60s) 缓存与容量淘汰 (64)
@@ -49,7 +49,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.3.5";
+  version = "0.4.0";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -3193,43 +3193,22 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
-  _extractSeriesBookIds(primaryData, primaryBookId) {
-    const result = [];
-    const seen = new Set();
-    const add = (value) => {
-      const id = Number(value);
-      if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) return;
-      seen.add(id);
-      result.push(id);
-    };
-    const series = this._value(primaryData, "series", "Series", []);
-    for (const item of Array.isArray(series) ? series : []) {
-      add(this._value(item, "id", "Id", null));
-    }
-    add(primaryBookId);
-    return result;
-  }
-
-  async _loadSeriesBookDetails(
-    seriesTitle,
-    representativeBookId,
-    isDirectId = false,
-  ) {
-    const primaryData = await this._getBookInfo(representativeBookId);
-    const primaryBook = this._value(primaryData, "book", "Book", null);
-    if (!primaryBook || typeof primaryBook !== "object") {
+  async _loadBookDetails(comicId, bookId, isDirectId = false) {
+    const bookInfo = await this._getBookInfo(bookId);
+    const book = this._value(bookInfo, "book", "Book", null);
+    if (!book || typeof book !== "object") {
       const err = new Error("GetBookInfo 未返回 Book");
       err.isContractError = true;
       throw err;
     }
-    const primaryBookId = Number(
-      this._value(primaryBook, "id", "Id", representativeBookId),
+    const resolvedBookId = Number(
+      this._value(book, "id", "Id", bookId),
     );
-    const type = String(this._value(primaryBook, "type", "Type", ""));
-    const chapters = this._value(primaryBook, "chapters", "Chapters", null);
+    const type = String(this._value(book, "type", "Type", ""));
+    const chapters = this._value(book, "chapters", "Chapters", null);
     if (
-      !Number.isSafeInteger(primaryBookId) ||
-      primaryBookId <= 0 ||
+      !Number.isSafeInteger(resolvedBookId) ||
+      resolvedBookId <= 0 ||
       type !== "Comic" ||
       !Array.isArray(chapters)
     ) {
@@ -3240,74 +3219,35 @@ class LightNovelShelf extends ComicSource {
 
     const resolvedSeriesTitle = String(
       this._value(
-        primaryData,
+        bookInfo,
         "seriesTitle",
         "SeriesTitle",
-        seriesTitle,
-      ) || seriesTitle,
+        comicId,
+      ) || comicId,
     );
-    this._rememberRepresentativeBookId(resolvedSeriesTitle, primaryBookId);
-    if (!isDirectId && resolvedSeriesTitle !== String(seriesTitle)) {
-      const err = new Error("GetBookInfo 返回的 SeriesTitle 与请求不一致");
-      err.code = "LIGHTNOVELSHELF_SERIES_TITLE_MISMATCH";
-      err.isContractError = true;
-      err.isSeriesTitleMismatch = true;
-      err.requestedSeriesTitle = seriesTitle;
-      err.resolvedSeriesTitle = resolvedSeriesTitle;
-      err.representativeBookId = representativeBookId;
-      throw err;
-    }
-    const bookIds = this._extractSeriesBookIds(primaryData, primaryBookId);
-    const secondaryIds = bookIds.filter((id) => id !== primaryBookId);
-    const settled = await Promise.allSettled(
-      secondaryIds.map((id) => this._getBookInfo(id)),
-    );
-    const booksById = new Map([[primaryBookId, primaryBook]]);
-    for (let index = 0; index < settled.length; index++) {
-      const result = settled[index];
-      if (result.status !== "fulfilled") continue;
-      const secondaryData = result.value;
-      const book = this._value(secondaryData, "book", "Book", secondaryData);
-      const id = Number(this._value(book, "id", "Id", NaN));
-      const bookType = String(this._value(book, "type", "Type", ""));
-      const bookChapters = this._value(book, "chapters", "Chapters", null);
-      if (
-        book &&
-        id === secondaryIds[index] &&
-        bookType === "Comic" &&
-        Array.isArray(bookChapters)
-      ) {
-        booksById.set(id, book);
+    if (!isDirectId) {
+      if (resolvedSeriesTitle !== String(comicId)) {
+        const err = new Error("GetBookInfo 返回的 SeriesTitle 与请求不一致");
+        err.code = "LIGHTNOVELSHELF_SERIES_TITLE_MISMATCH";
+        err.isContractError = true;
+        err.isSeriesTitleMismatch = true;
+        err.requestedSeriesTitle = comicId;
+        err.resolvedSeriesTitle = resolvedSeriesTitle;
+        err.representativeBookId = bookId;
+        throw err;
       }
+      this._rememberRepresentativeBookId(resolvedSeriesTitle, resolvedBookId);
     }
 
-    return {
-      seriesTitle: resolvedSeriesTitle,
-      primaryBookId: primaryBookId,
-      books: bookIds.map((id) => booksById.get(id)).filter(Boolean),
-    };
-  }
-
-  _loadSeriesDetails(seriesTitle, representativeBookId, isDirectId = false) {
-    const key = this._seriesCacheKey(seriesTitle);
-    const pending = this._seriesLoadPromises.get(key);
-    if (pending) return pending;
-    const request = this._loadSeriesBookDetails(
-      seriesTitle,
-      representativeBookId,
-      isDirectId,
-    );
-    const clear = () => {
-      if (this._seriesLoadPromises.get(key) === request) {
-        this._seriesLoadPromises.delete(key);
-      }
-    };
-    request.then(clear, clear);
-    return request;
+    return bookInfo;
   }
 
   async _bookCommentParams(comicId, page) {
-    const bookId = await this._resolveRepresentativeBookId(comicId);
+    const directBookId = this._parseDirectBookId(comicId);
+    const bookId =
+      directBookId !== null
+        ? directBookId
+        : await this._resolveRepresentativeBookId(comicId);
     const params = { Type: "Book", Id: bookId };
     if (page !== undefined) params.Page = page;
     return params;
@@ -3908,18 +3848,18 @@ class LightNovelShelf extends ComicSource {
       const apiBase = this.apiBase;
       const authGeneration = this._authGeneration;
 
-      let representativeBookId;
+      let bookId;
       if (isDirectId) {
-        representativeBookId = directBookId;
+        bookId = directBookId;
       } else {
-        representativeBookId = await this._resolveRepresentativeBookId(id);
+        bookId = await this._resolveRepresentativeBookId(id);
       }
 
-      let details;
+      let bookInfo;
       try {
-        details = await this._loadSeriesDetails(
+        bookInfo = await this._loadBookDetails(
           id,
-          representativeBookId,
+          bookId,
           isDirectId,
         );
       } catch (firstErr) {
@@ -3936,192 +3876,158 @@ class LightNovelShelf extends ComicSource {
         this._seriesRepresentativeBookIdSources.delete(key);
 
         const newBookId = await this._resolveRepresentativeBookId(id);
-        if (newBookId === representativeBookId) {
+        if (newBookId === bookId) {
           throw firstErr;
         }
-        details = await this._loadSeriesDetails(
+        bookInfo = await this._loadBookDetails(
           id,
           newBookId,
           false,
         );
       }
-      const books = Array.isArray(details.books) ? details.books : [];
-      const seriesTitle = details.seriesTitle || String(id);
+
+      const book = this._value(bookInfo, "book", "Book", null) || bookInfo;
+      const currentBookId = Number(this._value(book, "id", "Id", bookId));
+      const seriesTitle = String(
+        this._value(bookInfo, "seriesTitle", "SeriesTitle", "") || "",
+      ).trim();
       const targetComicId = String(id);
-      const metadata =
-        this._seriesListMetadata.get(
-          this._seriesCacheKey(id, apiBase, authGeneration),
-        ) ||
-        this._seriesListMetadata.get(
-          this._seriesCacheKey(seriesTitle, apiBase, authGeneration),
-        ) ||
+
+      let metadata =
         this._seriesListMetadata.get(
           this._seriesCacheKey(
-            `book:${representativeBookId}`,
+            `book:${currentBookId}`,
             apiBase,
             authGeneration,
           ),
         ) ||
         this._seriesListMetadata.get(
-          this._seriesCacheKey(representativeBookId, apiBase, authGeneration),
+          this._seriesCacheKey(currentBookId, apiBase, authGeneration),
         );
-      const primaryBook =
-        books.find(
-          (book) =>
-            Number(this._value(book, "id", "Id", NaN)) ===
-            details.primaryBookId,
-        ) || books[0];
-      const chapterPageCounts = new Map();
-      const chapterBookIds = new Map();
-      const groupedChapters = new Map();
-      const usedGroupNames = new Set();
-      const bookTitleCounts = {};
-
-      for (const book of books) {
-        const title = String(this._value(book, "title", "Title", "") || "").trim();
-        if (title) bookTitleCounts[title] = (bookTitleCounts[title] || 0) + 1;
+      if (!metadata && !isDirectId) {
+        const titleMeta = this._seriesListMetadata.get(
+          this._seriesCacheKey(id, apiBase, authGeneration),
+        );
+        if (
+          titleMeta &&
+          Number(titleMeta.representativeBookId) === currentBookId
+        ) {
+          metadata = titleMeta;
+        }
       }
 
-      for (let bookIndex = 0; bookIndex < books.length; bookIndex++) {
-        const book = books[bookIndex];
-        const bookId = Number(this._value(book, "id", "Id", NaN));
-        const list = (
-          Array.isArray(this._value(book, "chapters", "Chapters", []))
-            ? this._value(book, "chapters", "Chapters", [])
-            : []
-        )
-          .slice()
-          .sort(
-            (a, b) =>
-              Number(this._value(a, "sortNum", "SortNum", 0) || 0) -
-              Number(this._value(b, "sortNum", "SortNum", 0) || 0),
-          );
-        const uploader = this._value(book, "user", "User", {}) || {};
-        const uploaderName = String(
-          this._value(uploader, "userName", "UserName", "") || "",
-        ).trim();
-        const rawBookTitle = String(
-          this._value(book, "title", "Title", "") || "",
-        ).trim();
-        let groupName = rawBookTitle || uploaderName || `上传源 ${bookIndex + 1}`;
-        if (rawBookTitle && bookTitleCounts[rawBookTitle] > 1 && uploaderName) {
-          groupName = `${rawBookTitle}（${uploaderName}）`;
-        }
-        if (usedGroupNames.has(groupName)) {
-          const base = groupName;
-          let suffix = 2;
-          while (usedGroupNames.has(groupName)) {
-            groupName = `${base} #${suffix++}`;
-          }
-        }
-        usedGroupNames.add(groupName);
+      const bookTitle = String(
+        this._value(book, "title", "Title", "") || "",
+      ).trim();
+      const title = bookTitle || seriesTitle || targetComicId;
 
-        const group = new Map();
-        for (const chapter of list) {
-          const rawChapterId = this._value(chapter, "id", "Id", "");
-          const chapterId = this._comicChapterId(rawChapterId);
-          if (chapterId === null) continue;
-          const sortNum = this._value(chapter, "sortNum", "SortNum", "");
-          const title = this._value(chapter, "title", "Title", "");
-          group.set(String(chapterId), title || `第 ${sortNum} 话`);
+      const cover = this._normalizeUrl(
+        this._value(book, "cover", "Cover", "") ||
+          (metadata && metadata.cover) ||
+          "",
+      );
 
-          const pageCount = Number(
-            this._value(chapter, "pageCount", "PageCount", NaN),
-          );
-          if (Number.isSafeInteger(pageCount) && pageCount >= 0) {
-            chapterPageCounts.set(
-              this._comicContentStateKey(
-                targetComicId,
-                chapterId,
-                apiBase,
-                authGeneration,
-              ),
-              pageCount,
-            );
-          }
-          chapterBookIds.set(
-            this._comicChapterBookIdKey(
-              targetComicId,
-              chapterId,
-              apiBase,
-              authGeneration,
-            ),
-            bookId,
-          );
-        }
-        if (group.size > 0) groupedChapters.set(groupName, group);
-      }
-
-      const classificationFor = (book) => {
-        const extra = this._value(book, "extra", "Extra", {}) || {};
-        return (
-          this._value(extra, "classification", "Classification", {}) || {}
-        );
-      };
-      const primaryClassification = classificationFor(primaryBook);
+      const extra = this._value(book, "extra", "Extra", {}) || {};
+      const classification =
+        this._value(extra, "classification", "Classification", {}) || {};
       const author =
-        this._value(primaryBook, "author", "Author", "") ||
-        this._value(primaryClassification, "author", "Author", "") ||
+        this._value(book, "author", "Author", "") ||
+        this._value(classification, "author", "Author", "") ||
         "";
-      let tags = this._value(primaryClassification, "tags", "Tags", []);
-      if (!Array.isArray(tags) || tags.length === 0) {
-        for (const book of books) {
-          const candidate = this._value(
-            classificationFor(book),
-            "tags",
-            "Tags",
-            [],
-          );
-          if (Array.isArray(candidate) && candidate.length > 0) {
-            tags = candidate;
-            break;
-          }
-        }
-      }
-      let description =
-        this._value(primaryBook, "introduction", "Introduction", "") || "";
-      if (!description) {
-        const fallback = books.find(
-          (book) =>
-            !!this._value(book, "introduction", "Introduction", ""),
-        );
-        description =
-          this._value(fallback, "introduction", "Introduction", "") || "";
-      }
+      const rawTags = this._value(classification, "tags", "Tags", []);
+      const tags = Array.isArray(rawTags) ? rawTags : [];
+      const description =
+        this._value(book, "introduction", "Introduction", "") || "";
       const originalTitle = metadata ? metadata.originalTitle : "";
+
       const tagMap = {};
+      if (seriesTitle && seriesTitle !== title) {
+        tagMap["系列"] = [seriesTitle];
+      }
       const authors = String(author)
         .split(/、|×|\bx\b/i)
         .map((name) => name.trim())
         .filter(Boolean);
       if (authors.length) tagMap["作者"] = authors;
-      if (Array.isArray(tags) && tags.length) {
+      if (tags.length) {
         tagMap["标签"] = tags.map(String);
       }
       if (originalTitle) tagMap["原名"] = [String(originalTitle)];
 
-      const validTimes = (field) =>
-        books
-          .map((book) => this._value(book, field[0], field[1], null))
-          .filter((value) => value !== null && value !== undefined && value !== "")
-          .map((value) => ({ value: value, time: Date.parse(String(value)) }))
-          .filter((item) => Number.isFinite(item.time));
-      const updatedTimes = validTimes(["lastUpdatedAt", "LastUpdatedAt"]);
-      const createdTimes = validTimes(["createdAt", "CreatedAt"]);
-      const updateCandidates = updatedTimes.slice();
+      const subTitle =
+        (seriesTitle && seriesTitle !== title ? seriesTitle : "") ||
+        originalTitle ||
+        author ||
+        "";
+
+      const bookUpdated = this._value(
+        book,
+        "lastUpdatedAt",
+        "LastUpdatedAt",
+        null,
+      );
+      const bookCreated = this._value(book, "createdAt", "CreatedAt", null);
+      let updateTime = bookUpdated ? String(bookUpdated) : null;
       if (metadata && metadata.lastUpdatedAt) {
-        const metadataTime = Date.parse(String(metadata.lastUpdatedAt));
-        if (Number.isFinite(metadataTime)) {
-          updateCandidates.push({
-            value: metadata.lastUpdatedAt,
-            time: metadataTime,
-          });
+        const metaTime = Date.parse(String(metadata.lastUpdatedAt));
+        const currTime = updateTime ? Date.parse(updateTime) : NaN;
+        if (
+          Number.isFinite(metaTime) &&
+          (!Number.isFinite(currTime) || metaTime > currTime)
+        ) {
+          updateTime = String(metadata.lastUpdatedAt);
         }
       }
-      const updateTime =
-        updateCandidates.sort((a, b) => b.time - a.time)[0]?.value || null;
-      const uploadTime =
-        createdTimes.sort((a, b) => a.time - b.time)[0]?.value || null;
+      const uploadTime = bookCreated ? String(bookCreated) : null;
+
+      const chapters = new Map();
+      const rawChapters = this._value(book, "chapters", "Chapters", []);
+      const chapterList = (Array.isArray(rawChapters) ? rawChapters : [])
+        .slice()
+        .sort(
+          (a, b) =>
+            Number(this._value(a, "sortNum", "SortNum", 0) || 0) -
+            Number(this._value(b, "sortNum", "SortNum", 0) || 0),
+        );
+
+      const chapterPageCounts = new Map();
+      const chapterBookIds = new Map();
+
+      for (const chapter of chapterList) {
+        const rawChapterId = this._value(chapter, "id", "Id", "");
+        const chapterId = this._comicChapterId(rawChapterId);
+        if (chapterId === null) continue;
+        const sortNum = this._value(chapter, "sortNum", "SortNum", "");
+        const rawChapterTitle = String(
+          this._value(chapter, "title", "Title", "") || "",
+        ).trim();
+        const chapterTitle = rawChapterTitle || `第 ${sortNum} 话`;
+        chapters.set(String(chapterId), chapterTitle);
+
+        const pageCount = Number(
+          this._value(chapter, "pageCount", "PageCount", NaN),
+        );
+        if (Number.isSafeInteger(pageCount) && pageCount >= 0) {
+          chapterPageCounts.set(
+            this._comicContentStateKey(
+              targetComicId,
+              chapterId,
+              apiBase,
+              authGeneration,
+            ),
+            pageCount,
+          );
+        }
+        chapterBookIds.set(
+          this._comicChapterBookIdKey(
+            targetComicId,
+            chapterId,
+            apiBase,
+            authGeneration,
+          ),
+          currentBookId,
+        );
+      }
 
       if (apiBase === this.apiBase && authGeneration === this._authGeneration) {
         this._mergeComicMetadataCache(
@@ -4133,21 +4039,62 @@ class LightNovelShelf extends ComicSource {
         );
       }
 
-      return {
-        title: details.seriesTitle,
-        subTitle: originalTitle || author || "",
-        cover: this._normalizeUrl(
-          (metadata && metadata.cover) ||
-            this._value(primaryBook, "cover", "Cover", "") ||
+      const recommend = [];
+      const seenRelatedIds = new Set([currentBookId]);
+      const rawSeries = this._value(bookInfo, "series", "Series", []);
+      for (const item of Array.isArray(rawSeries) ? rawSeries : []) {
+        const rawId = this._value(item, "id", "Id", null);
+        const relatedId = Number(rawId);
+        if (!Number.isSafeInteger(relatedId) || relatedId <= 0) continue;
+        if (seenRelatedIds.has(relatedId)) continue;
+        const relatedTitle = String(
+          this._value(item, "title", "Title", "") || "",
+        ).trim();
+        if (!relatedTitle) continue;
+        seenRelatedIds.add(relatedId);
+
+        const relatedCover = this._normalizeUrl(
+          String(this._value(item, "cover", "Cover", "") || ""),
+        );
+        const relatedSeriesTitle = String(
+          this._value(item, "seriesTitle", "SeriesTitle", seriesTitle) ||
+            seriesTitle,
+        ).trim();
+        const relatedDesc = String(
+          this._value(item, "introduction", "Introduction", "") ||
+            this._value(item, "description", "Description", "") ||
             "",
-        ),
+        );
+        recommend.push({
+          id: `book:${relatedId}`,
+          title: relatedTitle,
+          subTitle: relatedSeriesTitle || "",
+          cover: relatedCover,
+          tags:
+            relatedSeriesTitle && relatedSeriesTitle !== relatedTitle
+              ? [relatedSeriesTitle]
+              : [],
+          description: relatedDesc,
+        });
+      }
+
+      const uploader = this._value(book, "user", "User", {}) || {};
+      const uploaderName = String(
+        this._value(uploader, "userName", "UserName", "") || "",
+      ).trim();
+
+      return {
+        title: title,
+        subTitle: subTitle,
+        cover: cover,
         description: description,
         tags: tagMap,
-        chapters: groupedChapters,
+        chapters: chapters,
+        recommend: recommend,
         updateTime: updateTime,
         uploadTime: uploadTime,
-        // Venera 评论 API 只提供漫画级 subId；绑定官方页面使用的代表 Book。
-        subId: String(details.primaryBookId),
+        uploader: uploaderName || undefined,
+        subId: String(currentBookId),
       };
     },
 

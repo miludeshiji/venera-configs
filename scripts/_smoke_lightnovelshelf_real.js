@@ -702,32 +702,128 @@ async function runSmoke() {
       `  ✓ GetBookInfo 安全形态诊断: shape=${responseShape}, 请求 Id=${resolvedBookId}, 返回 Id=${returnedBookId}, SeriesTitle=“${respSeriesTitle}”, Series数=${seriesCount}, 章节数=${chaptersCount}`,
     );
 
-    const details = await source.comic.loadInfo(targetTitle);
+    const directComicId = `book:${resolvedBookId}`;
+    const details = await source.comic.loadInfo(directComicId);
     if (!details || !details.title) {
       throw new Error("loadInfo 未返回有效漫画详情");
     }
-    const chapterGroups = Array.from(details.chapters.entries());
-    if (chapterGroups.length === 0) {
-      throw new Error("漫画详情未包含任何上传源章节");
+
+    // 核验 details.title === raw Book.Title
+    const activeRawBook =
+      (responseShape === "nested-book"
+        ? source._value(rawBookInfo, "book", "Book", null)
+        : rawBookInfo) || {};
+    const expectedRawTitle = String(
+      source._value(activeRawBook, "title", "Title", "") || "",
+    ).trim();
+    if (expectedRawTitle && details.title !== expectedRawTitle) {
+      throw new Error(
+        `details.title 校验失败: 实际 “${details.title}” vs raw Book “${expectedRawTitle}”`,
+      );
     }
-    const firstGroup = chapterGroups[0];
-    const firstChapterEntries = Array.from(firstGroup[1].entries());
-    if (firstChapterEntries.length === 0) {
-      throw new Error("分组内无章节条目");
-    }
-    const [sampleChapterIdStr, sampleChapterTitle] = firstChapterEntries[0];
-    const sampleChapterId = Number(sampleChapterIdStr);
-    console.log(
-      `  ✓ loadInfo 详情解析成功, 标题: “${details.title}”, 分组数: ${chapterGroups.length}`,
+
+    // 核验章节 ID 集合严格等于 raw Book.Chapters
+    const rawChaptersList =
+      (responseShape === "nested-book"
+        ? source._value(activeRawBook, "chapters", "Chapters", [])
+        : source._value(rawBookInfo, "chapters", "Chapters", [])) || [];
+    const expectedChapterIds = new Set(
+      (Array.isArray(rawChaptersList) ? rawChaptersList : [])
+        .map((ch) => source._comicChapterId(source._value(ch, "id", "Id", "")))
+        .filter((cid) => cid !== null),
     );
+    const actualChapterIds = new Set(
+      Array.from(details.chapters.keys()).map((k) => Number(k)),
+    );
+    if (expectedChapterIds.size !== actualChapterIds.size) {
+      throw new Error(
+        `章节数量不匹配: 实际 ${actualChapterIds.size} vs raw Book ${expectedChapterIds.size}`,
+      );
+    }
+    for (const cid of expectedChapterIds) {
+      if (!actualChapterIds.has(cid)) {
+        throw new Error(`详情缺失章节 ID: ${cid}`);
+      }
+    }
+
+    // 核验 recommend 等于有效 Series[] 排除当前
+    const rawSeriesList =
+      source._value(rawBookInfo, "series", "Series", []) || [];
+    const expectedRecommendIds = [];
+    const seenRecommendIds = new Set([resolvedBookId]);
+    for (const item of Array.isArray(rawSeriesList) ? rawSeriesList : []) {
+      const rid = Number(source._value(item, "id", "Id", null));
+      if (!Number.isSafeInteger(rid) || rid <= 0) continue;
+      if (seenRecommendIds.has(rid)) continue;
+      const rTitle = String(
+        source._value(item, "title", "Title", "") || "",
+      ).trim();
+      if (!rTitle) continue;
+      seenRecommendIds.add(rid);
+      expectedRecommendIds.push(rid);
+    }
+    if (!Array.isArray(details.recommend)) {
+      throw new Error("details.recommend 必须为数组");
+    }
+    const actualRecommendIds = details.recommend.map((r) =>
+      source._parseDirectBookId(r.id),
+    );
+    if (
+      actualRecommendIds.length !== expectedRecommendIds.length ||
+      !actualRecommendIds.every((id, idx) => id === expectedRecommendIds[idx])
+    ) {
+      throw new Error(
+        `recommend 列表与预期不符: 实际 [${actualRecommendIds}] vs 预期 [${expectedRecommendIds}]`,
+      );
+    }
+
     console.log(
-      `  ✓ 选定章节 [${sampleChapterIdStr}] “${sampleChapterTitle}” 用于后续只读测试`,
+      `  ✓ loadInfo (direct ID: ${directComicId}) 详情解析成功, 标题: “${details.title}”, 章节数: ${details.chapters.size}, 相关推荐数: ${details.recommend.length}`,
     );
 
-    // 7. 测试 GetComicContent (只读第 1 批，验证 Chapter.Id 与 BookId 回填)
-    console.log(`\n[7/9] 验证 GetComicContent (Cid: ${sampleChapterId})...`);
+    // 若有 related，打开第一个并验证其独立 Id/章节且原详情没有预取 secondary GetBookInfo
+    if (details.recommend.length > 0) {
+      const firstRelated = details.recommend[0];
+      const relatedBookId = source._parseDirectBookId(firstRelated.id);
+      console.log(
+        `  ✓ 验证相关书目: 按需加载首个相关 “${firstRelated.title}” (${firstRelated.id})...`,
+      );
+      // 验证打开前缓存中不存在该 related 的 BookInfo（即原详情零预取）
+      const relatedCacheKey = source._bookInfoCacheKey(relatedBookId);
+      if (source._bookInfoCache.has(relatedCacheKey)) {
+        throw new Error(
+          `原详情违规预取了 secondary BookInfo (${relatedBookId})！`,
+        );
+      }
+
+      const relatedDetails = await source.comic.loadInfo(firstRelated.id);
+      if (!relatedDetails || !relatedDetails.title) {
+        throw new Error("相关漫画详情加载失败");
+      }
+      if (relatedDetails.subId !== String(relatedBookId)) {
+        throw new Error(
+          `相关漫画 subId 错误: ${relatedDetails.subId} vs ${relatedBookId}`,
+        );
+      }
+      console.log(
+        `  ✓ 相关漫画独立详情验证成功: 标题 “${relatedDetails.title}”, 章节数: ${relatedDetails.chapters.size}`,
+      );
+    }
+
+    const chapterEntries = Array.from(details.chapters.entries());
+    if (chapterEntries.length === 0) {
+      throw new Error("漫画详情未包含任何章节条目");
+    }
+    const [sampleChapterIdStr, sampleChapterTitle] = chapterEntries[0];
+    const sampleChapterId = Number(sampleChapterIdStr);
+    console.log(
+      `  ✓ 选定章节 [${sampleChapterIdStr}] “${sampleChapterTitle}” 用于后续正文只读测试`,
+    );
+
+    // 7. 测试 GetComicContent (只读第 1 批，使用 direct comicId 验证 Chapter.Id 与 BookId 回填)
+    console.log(`\n[7/9] 验证 GetComicContent (comicId: ${directComicId}, Cid: ${sampleChapterId})...`);
     const contentBatch = await source._loadComicContentBatch(
-      targetTitle,
+      directComicId,
       sampleChapterId,
       0,
     );
@@ -739,7 +835,7 @@ async function runSmoke() {
       throw new Error("GetComicContent 未返回图片列表");
     }
     const backfilledBookId = source._comicChapterBookIds.get(
-      source._comicChapterBookIdKey(targetTitle, sampleChapterId),
+      source._comicChapterBookIdKey(directComicId, sampleChapterId),
     );
     console.log(
       `  ✓ GetComicContent 成功, 总页数: ${contentBatch.total}, 本批页数: ${contentBatch.images.length}`,
@@ -769,18 +865,17 @@ async function runSmoke() {
     }
     console.log(`  ✓ GetBookListByIds 成功, 返回条目数: ${bookList.length}`);
 
-    // 9. 测试 GetComments (Type=Book)
+    // 9. 测试 GetComments (Type=Book，使用 direct comicId)
     console.log(`\n[9/9] 验证 GetComments (Type: Book, Id: ${resolvedBookId})...`);
     const commentsResult = await source.comic.loadComments(
-      targetTitle,
-      String(resolvedBookId),
+      directComicId,
+      details.subId,
       1,
       null,
     );
     console.log(
       `  ✓ GetComments 成功, 评论数: ${commentsResult.comments.length}, 最大页: ${commentsResult.maxPage}`,
     );
-
     console.log("\n==================================================");
     console.log("【全部 9 项真实只读 Smoke 验证通过！】");
     console.log("==================================================");

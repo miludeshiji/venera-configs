@@ -31,13 +31,13 @@
  * 24. Gzip Hub 响应解码并在 invocation 中启用 UseGzip
  * 25. 滑动窗口按逻辑 invocation 计费并允许并发
  * 26. 阅读进度保存准确且重复位置不重复写入
- * 27. 评论使用代表 Book.Id 并保留结构化 ReplyId
+ * 27. 评论使用当前 Book.Id 并保留结构化 ReplyId
  * 28. 新版详情并发隔离 BookId、页数并禁用旧接口
  * 29. 限流等待期间 socket 换代后非幂等请求安全重试一次
  * 30. logout 立即取消限流 waiter 且旧回调不会恢复请求
  * 31. 漫画元数据缓存按 LRU 上限淘汰最旧漫画
- * 32. 冷启动精确解析并恢复多上传版本与 Book 评论
- * 33. 同一系列并发复用搜索与全部 BookInfo 请求
+ * 32. 冷启动 legacy 标题解析代表单书：仅请求当前 Book、构建 recommend、单层章节只含当前书且评论隔离
+ * 33. 同一 Book 并发请求复用单飞，不同 Book 并发隔离且不触发相关书预取
  * 34. ReplyComment 等非幂等调用在 socket.send 自身直接 reject 时可安全重试成功
  * 35. BookInfo Cache TTL 到期后刷新拉取新章节
  * 36. BookInfo Cache 达到容量上限时淘汰最旧条目
@@ -57,12 +57,13 @@
  * 50. 坏 persistent 映射校验失败先保留，候选验证成功后原子替换；全失败保留旧映射绝不循环
  * 51. direct ID 遇到 BookInfo 错误坚决不搜索
  * 52. 网络/认证/超时/限流运行错误坚决不删除 persistent 映射
- * 53. 主次 Book 响应形态混合（主 Book 为 root 形态，次 Book 为 nested 形态且异常时降级）
+ * 53. 单书详情兼容 nested 与 root 响应形态，recommend 过滤/去重/顺序/direct ID 且不预取详情
  * 54. 来源追踪解析与精准删除标题映射方法验证
  * 55. 真实 smoke 主路径：direct book:<id> 安全形态诊断与 loadInfo 零搜索验证
  * 56. 新列表/发现/历史/搜索输出全部为 book:<正整数>，严格校验代表 Book.Id
  * 57. legacy 恢复从官方 GetReadHistory 按 24 本分片串行恢复并严格验证
  * 58. 确定性无结果建立短时负缓存且同标题并发共享 Promise 单飞，登出/清理重置负缓存
+ * 59. 打开 direct 相关书 book:<id> 不得改写 SeriesTitle 代表映射，旧标题收藏与记忆仍打开原代表 Book
  */
 
 const fs = require("node:fs");
@@ -1749,7 +1750,7 @@ async function runTests() {
     assert.strictEqual(calls[0].options.retryTransport, false);
   });
 
-  await test("27. 评论使用代表 Book.Id 并保留结构化 ReplyId", async () => {
+  await test("27. 评论使用当前 Book.Id 并保留结构化 ReplyId", async () => {
     const { source } = createSourceHarness();
     const calls = [];
     source._rememberRepresentativeBookId("series", 100);
@@ -1932,15 +1933,15 @@ async function runTests() {
       33,
     );
   });
-  await test("32. 冷启动精确解析并恢复多上传版本与 Book 评论", async () => {
+  await test("32. 冷启动 legacy 标题解析代表单书：仅请求当前 Book、构建 recommend、单层章节只含当前书且评论隔离", async () => {
     const { source } = createSourceHarness();
     const calls = [];
     const response = (id, title, user, chapterId) => ({
       SeriesTitle: "Series A",
       Series: [
-        { Id: 100, Title: "单行本", Cover: "primary.jpg" },
-        { Id: 200, Title: "单行本", Cover: "secondary.jpg" },
-        { Id: 300, Title: "失败版本", Cover: "" },
+        { Id: 100, Title: "第一卷", Cover: "primary.jpg" },
+        { Id: 200, Title: "第二卷", Cover: "secondary.jpg" },
+        { Id: 300, Title: "第三卷", Cover: "third.jpg" },
       ],
       Book: {
         Id: id,
@@ -1948,7 +1949,7 @@ async function runTests() {
         Title: title,
         Cover: `${id}.jpg`,
         Author: "作者",
-        Introduction: id === 100 ? "简介" : "",
+        Introduction: id === 100 ? "简介 100" : "简介 200",
         LastUpdatedAt: `2026-01-0${id === 100 ? 2 : 3}T00:00:00Z`,
         CreatedAt: `2025-01-0${id === 100 ? 2 : 1}T00:00:00Z`,
         User: { UserName: user },
@@ -1975,82 +1976,159 @@ async function runTests() {
         };
       }
       if (target === "GetBookInfo") {
-        if (params.Id === 100) return response(100, "单行本", "A", 1001);
-        if (params.Id === 200) return response(200, "单行本", "B", 2001);
-        throw new Error("secondary unavailable");
+        if (params.Id === 100) return response(100, "单行本 第一卷", "A", 1001);
+        if (params.Id === 200) return response(200, "单行本 第二卷", "B", 2001);
+        throw new Error(`未预期的 secondary 请求: ${params.Id}`);
       }
       if (target === "GetComments") {
         return { Data: [], Users: {}, Commentaries: {}, TotalPages: 1 };
       }
+      if (target === "SaveReadPosition") {
+        return null;
+      }
       throw new Error(`Unexpected Hub call: ${target}`);
     };
 
+    // 1. 通过 legacy 标题打开详情：解析出代表 Book 100，且仅请求 Book 100
     const details = await source.comic.loadInfo("Series A");
-    assert.strictEqual(details.title, "Series A");
+    assert.strictEqual(details.title, "单行本 第一卷", "详情标题必须为当前 Book.Title，禁止被 SeriesTitle 覆盖");
     assert.strictEqual(details.subId, "100");
-    assert.strictEqual(details.cover, "https://api.lightnovel.life/series.jpg");
-    assert.deepStrictEqual(Array.from(details.chapters.keys()), [
-      "单行本（A）",
-      "单行本（B）",
-    ]);
-    assert.strictEqual(
-      source._comicChapterBookIds.get(
-        source._comicChapterBookIdKey("Series A", 2001),
-      ),
-      200,
-    );
-    await source.comic.loadComments("Series A", details.subId, 1, null);
-    const commentCall = calls.find((call) => call.target === "GetComments");
-    assert.deepStrictEqual(JSON.parse(JSON.stringify(commentCall.params)), {
-      Type: "Book",
-      Id: 100,
-      Page: 1,
-    });
-    assert.strictEqual(
-      calls.filter((call) => call.target === "SearchComicSeries").length,
-      1,
-    );
+    assert.strictEqual(details.cover, "https://api.lightnovel.life/100.jpg");
     assert.strictEqual(
       calls.filter((call) => call.target === "GetBookInfo").length,
-      3,
+      1,
+      "加载当前书详情时严禁预取 Series 内其他 secondary BookInfo",
     );
+
+    // 2. 单层章节结构：仅含当前 Book 章节，无上传源分组与跨书合并
+    assert.ok(details.chapters instanceof Map);
+    assert.strictEqual(details.chapters.size, 1);
+    assert.strictEqual(details.chapters.get("1001"), "第一话");
+    assert.strictEqual(details.chapters.has("2001"), false);
+    assert.strictEqual(
+      source._comicChapterBookIds.get(
+        source._comicChapterBookIdKey("Series A", 1001),
+      ),
+      100,
+    );
+
+    // 3. recommend 列表：包含其他卷、排除当前卷 100、id 必须为 direct book:<Id>
+    assert.strictEqual(details.recommend.length, 2);
+    assert.strictEqual(details.recommend[0].id, "book:200");
+    assert.strictEqual(details.recommend[0].title, "第二卷");
+    assert.strictEqual(details.recommend[0].subTitle, "Series A");
+    assert.strictEqual(details.recommend[1].id, "book:300");
+    assert.strictEqual(details.recommend[1].title, "第三卷");
+
+    // 4. 用户点击推荐中的相关漫画：以 direct ID 独立打开次卷，此时才按需发起第 2 次 GetBookInfo
+    const relatedDetails = await source.comic.loadInfo(details.recommend[0].id);
+    assert.strictEqual(relatedDetails.title, "单行本 第二卷");
+    assert.strictEqual(relatedDetails.subId, "200");
+    assert.strictEqual(relatedDetails.chapters.size, 1);
+    assert.strictEqual(relatedDetails.chapters.get("2001"), "第一话");
+    assert.strictEqual(relatedDetails.chapters.has("1001"), false);
+    assert.strictEqual(
+      calls.filter((call) => call.target === "GetBookInfo").length,
+      2,
+      "点击相关漫画后才按需请求该 BookInfo",
+    );
+
+    // 5. 评论与阅读进度分别按各 Book 隔离
+    await source.comic.loadComments("Series A", details.subId, 1, null);
+    await source.comic.loadComments(details.recommend[0].id, relatedDetails.subId, 1, null);
+    const commentCalls = calls.filter((call) => call.target === "GetComments");
+    assert.strictEqual(commentCalls.length, 2);
+    assert.strictEqual(commentCalls[0].params.Id, 100);
+    assert.strictEqual(commentCalls[1].params.Id, 200);
+
+    await source.comic.updateReadProgress("Series A", "1001", 3);
+    await source.comic.updateReadProgress(details.recommend[0].id, "2001", 5);
+    const progressCalls = calls.filter((call) => call.target === "SaveReadPosition");
+    assert.strictEqual(progressCalls.length, 2);
+    assert.strictEqual(progressCalls[0].params.Bid, 100);
+    assert.strictEqual(progressCalls[1].params.Bid, 200);
   });
 
-  await test("33. 同一系列并发复用搜索与全部 BookInfo 请求", async () => {
+  await test("33. 同一 Book 并发请求复用单飞，不同 Book 并发隔离且不触发相关书预取", async () => {
     const { source } = createSourceHarness();
     let searches = 0;
-    let bookCalls = 0;
+    const bookCallCounts = { 100: 0, 200: 0 };
     source._hubCall = async (target, params) => {
       if (target === "SearchComicSeries") {
         searches += 1;
         return { Data: [{ Id: 100, Title: "Series A" }] };
       }
       if (target === "GetBookInfo") {
-        bookCalls += 1;
-        return {
-          SeriesTitle: "Series A",
-          Series: [{ Id: 100, Title: "A", Cover: "" }],
-          Book: {
-            Id: 100,
-            Type: "Comic",
-            Title: "A",
-            Cover: "",
-            Author: "",
-            Introduction: "",
-            User: { UserName: "U" },
-            Chapters: [],
-          },
-        };
+        const id = params.Id;
+        bookCallCounts[id] = (bookCallCounts[id] || 0) + 1;
+        if (id === 100) {
+          return {
+            SeriesTitle: "Series A",
+            Series: [
+              { Id: 100, Title: "Book 100", Cover: "" },
+              { Id: 200, Title: "Book 200", Cover: "" },
+            ],
+            Book: {
+              Id: 100,
+              Type: "Comic",
+              Title: "Book 100",
+              Cover: "",
+              Author: "",
+              Introduction: "",
+              User: { UserName: "U100" },
+              Chapters: [{ Id: 1001, SortNum: 1, Title: "话 1" }],
+            },
+          };
+        }
+        if (id === 200) {
+          return {
+            SeriesTitle: "Series A",
+            Series: [
+              { Id: 100, Title: "Book 100", Cover: "" },
+              { Id: 200, Title: "Book 200", Cover: "" },
+            ],
+            Book: {
+              Id: 200,
+              Type: "Comic",
+              Title: "Book 200",
+              Cover: "",
+              Author: "",
+              Introduction: "",
+              User: { UserName: "U200" },
+              Chapters: [{ Id: 2001, SortNum: 1, Title: "话 2" }],
+            },
+          };
+        }
+        throw new Error(`意外请求了未声明的 Book: ${id}`);
       }
       throw new Error(`Unexpected Hub call: ${target}`);
     };
+
+    // 1. 同一 Book（通过 legacy 标题并发加载两次）：复用搜索与单个 BookInfo 单飞
     const [a, b] = await Promise.all([
       source.comic.loadInfo("Series A"),
       source.comic.loadInfo("Series A"),
     ]);
-    assert.strictEqual(a.title, b.title);
-    assert.strictEqual(searches, 1);
-    assert.strictEqual(bookCalls, 1);
+    assert.strictEqual(a.title, "Book 100");
+    assert.strictEqual(b.title, "Book 100");
+    assert.strictEqual(searches, 1, "搜索请求应单飞复用");
+    assert.strictEqual(bookCallCounts[100], 1, "同 Book 请求应在 Promise 单飞并复用");
+    assert.strictEqual(bookCallCounts[200], 0, "相关书 200 不得被预取");
+
+    // 2. 不同 Book（direct ID 并发加载）：互不干扰独立请求
+    const [c, d] = await Promise.all([
+      source.comic.loadInfo("book:100"),
+      source.comic.loadInfo("book:200"),
+    ]);
+    assert.strictEqual(c.title, "Book 100");
+    assert.strictEqual(d.title, "Book 200");
+    // book:100 命中已缓存条目（未到 TTL），book:200 发起一次独立请求
+    assert.strictEqual(bookCallCounts[100], 1, "book:100 在 TTL 内命中缓存");
+    assert.strictEqual(bookCallCounts[200], 1, "book:200 独立发起请求");
+    assert.strictEqual(c.chapters.size, 1);
+    assert.strictEqual(d.chapters.size, 1);
+    assert.strictEqual(c.chapters.has("1001"), true);
+    assert.strictEqual(d.chapters.has("2001"), true);
   });
 
   await test("34. ReplyComment 等非幂等调用在 socket.send 自身直接 reject 时可安全重试成功", async () => {
@@ -2160,12 +2238,12 @@ async function runTests() {
       // 首次加载
       const first = await source.comic.loadInfo("Series TTL");
       assert.strictEqual(getBookInfoCalls, 1);
-      assert.strictEqual(first.chapters.get("Series TTL").size, 1);
+      assert.strictEqual(first.chapters.size, 1);
 
       // 立即再次加载，在 TTL 窗口内，应命中缓存
       const second = await source.comic.loadInfo("Series TTL");
       assert.strictEqual(getBookInfoCalls, 1, "TTL 窗口内应直接复用缓存");
-      assert.strictEqual(second.chapters.get("Series TTL").size, 1);
+      assert.strictEqual(second.chapters.size, 1);
 
       // 等待超过 TTL
       await new Promise((resolve) => setTimeout(resolve, 35));
@@ -2173,7 +2251,7 @@ async function runTests() {
       // 第三次加载，TTL 已过期，应重新请求并获取新章节
       const third = await source.comic.loadInfo("Series TTL");
       assert.strictEqual(getBookInfoCalls, 2, "TTL 过期后应重新调用 GetBookInfo");
-      assert.strictEqual(third.chapters.get("Series TTL").size, 2, "新请求应包含更新的第 2 话");
+      assert.strictEqual(third.chapters.size, 2, "新请求应包含更新的第 2 话");
     } finally {
       source.constructor.bookInfoCacheTtlMs = originalTtl;
     }
@@ -2232,7 +2310,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.3.5");
+    assert.strictEqual(source.version, "0.4.0");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -3132,19 +3210,25 @@ async function runTests() {
     }
   });
 
-  await test("53. 主次 Book 响应形态混合（主 Book 为 root 形态，次 Book 为 nested 形态且异常时降级）", async () => {
+  await test("53. 单书详情兼容 nested 与 root 响应形态，recommend 过滤/去重/顺序/direct ID 且不预取详情", async () => {
     const { source } = createSourceHarness();
+    const calls = [];
 
     source._hubCall = async (target, params) => {
+      calls.push({ target, params });
       if (target === "GetBookInfo") {
         if (params.Id === 100) {
-          // 主 Book：root 根级形态
+          // 当前 Book：root 根级形态，Series 数组中包含当前 ID、重复项、无效项与空标题
           return {
             SeriesTitle: "混合系列",
             Series: [
-              { Id: 100, Title: "主卷" },
-              { Id: 200, Title: "次卷 1" },
-              { Id: 300, Title: "次卷 2" },
+              { Id: 100, Title: "主卷", Cover: "cover100.jpg" }, // 当前书 -> 排除
+              { Id: 200, Title: "次卷 1", Cover: "cover200.jpg" }, // 有效
+              { Id: -10, Title: "负数 ID", Cover: "" }, // 无效 ID -> 过滤
+              { Id: "invalid", Title: "非数字 ID", Cover: "" }, // 无效 ID -> 过滤
+              { Id: 300, Title: "   ", Cover: "" }, // 空标题 -> 过滤
+              { Id: 200, Title: "次卷 1 重复", Cover: "" }, // 重复 ID -> 去重保留首个
+              { Id: 400, Title: "次卷 2", Cover: "cover400.jpg" }, // 有效
             ],
             Id: 100,
             Type: "Comic",
@@ -3159,7 +3243,10 @@ async function runTests() {
           // 次 Book 1：nested 嵌套形态
           return {
             SeriesTitle: "混合系列",
-            Series: [{ Id: 200, Title: "次卷 1" }],
+            Series: [
+              { Id: 100, Title: "主卷", Cover: "cover100.jpg" },
+              { Id: 200, Title: "次卷 1", Cover: "cover200.jpg" },
+            ],
             Book: {
               Id: 200,
               Type: "Comic",
@@ -3171,34 +3258,61 @@ async function runTests() {
             },
           };
         }
-        if (params.Id === 300) {
-          // 次 Book 2：无效契约响应（非 Comic）
-          return {
-            SeriesTitle: "混合系列",
-            Series: [{ Id: 300, Title: "次卷 2" }],
-            Book: {
-              Id: 300,
-              Type: "Novel",
-              Chapters: [],
-            },
-          };
-        }
+        throw new Error(`未声明的 BookInfo 请求: ${params.Id}`);
       }
       throw new Error(`Unexpected call: ${target}`);
     };
 
+    // 1. 加载 root 形态的单书详情
     const details = await source.comic.loadInfo("book:100");
-    assert.strictEqual(details.title, "混合系列");
+    assert.strictEqual(details.title, "主卷", "详情标题应为当前 Book.Title");
     assert.strictEqual(details.subId, "100");
+    assert.strictEqual(calls.filter((c) => c.target === "GetBookInfo").length, 1, "只请求当前 Book");
 
-    // 主卷与次卷 1 均成功聚合，次卷 2 优雅降级忽略
-    const chapterMap = details.chapters;
-    assert.ok(chapterMap.has("主卷"));
-    assert.ok(chapterMap.has("次卷 1"));
-    assert.strictEqual(chapterMap.size, 2);
+    // 2. 章节为单层 Map，只录当前 Book 的章节
+    assert.ok(details.chapters instanceof Map);
+    assert.strictEqual(details.chapters.size, 1);
+    assert.strictEqual(details.chapters.get("1001"), "主卷第1话");
+    assert.strictEqual(details.chapters.has("2001"), false);
+
+    // 3. recommend 过滤与去重检查：排除当前 100、过滤无效/空标题、按 ID 去重、保留官方顺序
+    assert.strictEqual(details.recommend.length, 2);
+    assert.deepStrictEqual(
+      JSON.parse(
+        JSON.stringify(
+          details.recommend.map((r) => ({ id: r.id, title: r.title })),
+        ),
+      ),
+      [
+        { id: "book:200", title: "次卷 1" },
+        { id: "book:400", title: "次卷 2" },
+      ],
+      "recommend 必须严格排除当前书、过滤无效项/空标题、按 ID 去重并保留顺序",
+    );
+    assert.strictEqual(details.recommend[0].id, "book:200");
+    assert.strictEqual(details.recommend[0].title, "次卷 1");
+    assert.strictEqual(details.recommend[0].subTitle, "混合系列");
+    assert.strictEqual(
+      details.recommend[0].cover,
+      "https://api.lightnovel.life/cover200.jpg",
+    );
+    assert.strictEqual(details.recommend[1].id, "book:400");
+    assert.strictEqual(details.recommend[1].title, "次卷 2");
+    assert.strictEqual(details.recommend[1].subTitle, "混合系列");
+    assert.strictEqual(
+      details.recommend[1].cover,
+      "https://api.lightnovel.life/cover400.jpg",
+    );
+    // 4. 打开 recommend 中的 direct ID (book:200，为 nested 形态)，验证独立请求与状态隔离
+    const details200 = await source.comic.loadInfo(details.recommend[0].id);
+    assert.strictEqual(details200.title, "次卷 1");
+    assert.strictEqual(details200.subId, "200");
+    assert.strictEqual(details200.chapters.size, 1);
+    assert.strictEqual(details200.chapters.get("2001"), "次卷第1话");
+    assert.strictEqual(details200.chapters.has("1001"), false);
 
     assert.strictEqual(source._knownComicPageCount("book:100", 1001), 5);
-    assert.strictEqual(source._knownComicPageCount("book:100", 2001), 6);
+    assert.strictEqual(source._knownComicPageCount("book:200", 2001), 6);
   });
 
   await test("54. 来源追踪解析与精准删除标题映射方法验证", async () => {
@@ -3500,6 +3614,85 @@ async function runTests() {
     // 3. 登出清理：重置负缓存
     source._clearComicContentStates();
     assert.strictEqual(source._seriesNegativeCache.size, 0, "清理入口必须清空负缓存");
+  });
+
+  await test("59. 打开 direct 相关书 book:<id> 不得改写 SeriesTitle 代表映射，旧标题收藏与记忆仍打开原代表 Book", async () => {
+    const { source } = createSourceHarness();
+    const calls = [];
+
+    // 1. 初始化：Series A 的代表 Book 为 100（通过列表元数据或持久映射建立）
+    source._rememberRepresentativeBookId("Series A", 100);
+    source._setPersistentSeriesBookId("Series A", 100);
+    assert.strictEqual(
+      source._seriesRepresentativeBookIds.get(source._seriesCacheKey("Series A")),
+      100,
+    );
+    assert.strictEqual(source._getPersistentSeriesBookId("Series A"), 100);
+
+    source._hubCall = async (target, params) => {
+      calls.push({ target, params });
+      if (target === "GetBookInfo") {
+        if (params.Id === 100) {
+          return {
+            SeriesTitle: "Series A",
+            Series: [
+              { Id: 100, Title: "单行本 第一卷" },
+              { Id: 200, Title: "单行本 第二卷" },
+            ],
+            Book: {
+              Id: 100,
+              Type: "Comic",
+              Title: "单行本 第一卷",
+              Chapters: [{ Id: 1001, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+        if (params.Id === 200) {
+          // 相关书 200，其 GetBookInfo 返回同样的 SeriesTitle: "Series A"
+          return {
+            SeriesTitle: "Series A",
+            Series: [
+              { Id: 100, Title: "单行本 第一卷" },
+              { Id: 200, Title: "单行本 第二卷" },
+            ],
+            Book: {
+              Id: 200,
+              Type: "Comic",
+              Title: "单行本 第二卷",
+              Chapters: [{ Id: 2001, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    // 2. 消费者通过 recommend 或 direct ID 打开相关书 book:200
+    const details200 = await source.comic.loadInfo("book:200");
+    assert.strictEqual(details200.title, "单行本 第二卷");
+    assert.strictEqual(details200.subId, "200");
+
+    // 3. 核心断言：打开相关书不得改写 Series A 的内存与持久化映射
+    const memKey = source._seriesCacheKey("Series A");
+    assert.strictEqual(
+      source._seriesRepresentativeBookIds.get(memKey),
+      100,
+      "direct 相关书加载后，Series A 的内存代表映射必须保持原代表 100，绝不得被覆盖为 200",
+    );
+    assert.strictEqual(
+      source._getPersistentSeriesBookId("Series A"),
+      100,
+      "direct 相关书加载后，Series A 的持久化代表映射必须保持原代表 100，绝不得被覆盖为 200",
+    );
+
+    // 4. 用户重新使用 legacy 系列标题 "Series A" 打开漫画：仍旧打开原代表 Book 100，收藏绝不发生漂移
+    const legacyDetails = await source.comic.loadInfo("Series A");
+    assert.strictEqual(
+      legacyDetails.title,
+      "单行本 第一卷",
+      "legacy 标题仍应权威打开原代表 Book 100",
+    );
+    assert.strictEqual(legacyDetails.subId, "100");
   });
 
   assert.strictEqual(
