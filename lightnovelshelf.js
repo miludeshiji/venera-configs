@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.4.0
+ * 版本：0.4.1
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -14,7 +14,7 @@
  * - 9 次/5.5 秒请求调度器 / Gzip 响应解码
  * - 漫画阅读进度单向同步（Venera → 轻书架）
  * - 新版 GetBookInfo 单书漫画详情（每个 Book.Id 独立、同系列其他书位于详情“相关”、单层章节不跨书合并） / Book 评论与楼中楼回复
- * - 稳定 book:<id> 漫画身份模型 / 旧 SeriesTitle 通过官方历史与有界搜索安全恢复 / direct ID 直连跳过搜索
+ * - 稳定 <Title>@@book:<id> 漫画身份模型 / 旧 SeriesTitle 通过官方历史与有界搜索安全恢复 / direct ID 直连跳过搜索
  * - 发现页多区块容错独立 settle / 正文 BookId 回填与阅读进度同步
  * - BookInfo TTL (60s) 缓存与容量淘汰 (64)
  * 使用前：
@@ -49,7 +49,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.4.0";
+  version = "0.4.1";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -2501,10 +2501,19 @@ class LightNovelShelf extends ComicSource {
   _parseDirectBookId(id) {
     const raw = String(id == null ? "" : id).trim();
     if (!raw) return null;
-    const match = raw.match(/^(?:book:)?([1-9]\d*)$/i);
-    if (!match) return null;
-    const parsed = Number(match[1]);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    const compositeMatch = raw.match(/^(.+)@@book:([1-9]\d*)$/i);
+    if (compositeMatch) {
+      const title = compositeMatch[1].trim();
+      if (!title) return null;
+      const parsed = Number(compositeMatch[2]);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    }
+    const directMatch = raw.match(/^(?:book:)?([1-9]\d*)$/i);
+    if (directMatch) {
+      const parsed = Number(directMatch[1]);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+    }
+    return null;
   }
 
   _deleteSeriesBookMapping(seriesTitle, bookId = null, apiBase = this.apiBase) {
@@ -2648,6 +2657,16 @@ class LightNovelShelf extends ComicSource {
         ),
         metadata,
       );
+      if (title) {
+        this._seriesListMetadata.set(
+          this._seriesCacheKey(
+            `${title}@@book:${representativeBookId}`,
+            apiBase,
+            authGeneration,
+          ),
+          metadata,
+        );
+      }
     }
   }
 
@@ -3359,8 +3378,8 @@ class LightNovelShelf extends ComicSource {
     this._rememberSeriesListMetadata(item);
 
     return {
-      // 新条目永久使用 book:<Book.Id> 作为 Venera comicId；展示标题保持不变
-      id: `book:${bookId}`,
+      // Venera-host-safe identity: 保留标题并附加 @@book:<Book.Id> 确定性后缀；展示标题保持不变
+      id: `${title}@@book:${bookId}`,
       title: title,
       subTitle: original || (count ? `${count} 话` : ""),
       cover: this._normalizeUrl(cover),

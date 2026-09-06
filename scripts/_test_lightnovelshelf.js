@@ -51,7 +51,7 @@
  * 44. book:<正整数> 与纯数字 direct ID 直连跳过搜索且消除一致性冲突
  * 45. 发现页首层多区块独立 settle、局部失败容错与全部失败抛错
  * 46. 正文 GetComicContent 校验 Chapter.Id 并回填 BookId 支持 SaveReadPosition
- * 47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 book:<Id>
+ * 47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 <Title>@@book:<Id>
  * 48. BookInfo 规范化兼容 nested (data.Book) 与 root (根级对象) 两形态
  * 49. 无效响应（null/string/空对象/Id不匹配/非Comic/Chapters非数组）不缓存并抛出安全诊断且再次请求重新拉取
  * 50. 坏 persistent 映射校验失败先保留，候选验证成功后原子替换；全失败保留旧映射绝不循环
@@ -60,10 +60,11 @@
  * 53. 单书详情兼容 nested 与 root 响应形态，recommend 过滤/去重/顺序/direct ID 且不预取详情
  * 54. 来源追踪解析与精准删除标题映射方法验证
  * 55. 真实 smoke 主路径：direct book:<id> 安全形态诊断与 loadInfo 零搜索验证
- * 56. 新列表/发现/历史/搜索输出全部为 book:<正整数>，严格校验代表 Book.Id
+ * 56. 新列表/发现/历史/搜索输出全部为 <Title>@@book:<正整数>，严格校验代表 Book.Id
  * 57. legacy 恢复从官方 GetReadHistory 按 24 本分片串行恢复并严格验证
  * 58. 确定性无结果建立短时负缓存且同标题并发共享 Promise 单飞，登出/清理重置负缓存
  * 59. 打开 direct 相关书 book:<id> 不得改写 SeriesTitle 代表映射，旧标题收藏与记忆仍打开原代表 Book
+ * 60. 宿主安全回归：latest/popular/history/search 宿主安全卡片与零搜索直连加载、旧标题恢复与 recommend 兼容
  */
 
 const fs = require("node:fs");
@@ -2310,7 +2311,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.4.0");
+    assert.strictEqual(source.version, "0.4.1");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -2835,7 +2836,7 @@ async function runTests() {
     });
   });
 
-  await test("47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 book:<Id>", async () => {
+  await test("47. Count 文案在列表与描述中严格规范为“话”，卡片 ID 统一为 <Title>@@book:<Id>", async () => {
     const { source } = createSourceHarness();
 
     const comicItem = source._comicFromListItem({
@@ -2845,7 +2846,7 @@ async function runTests() {
       LastUpdatedAt: "2026-09-06",
     });
 
-    assert.strictEqual(comicItem.id, "book:123", "列表卡片 ID 必须统一格式化为 book:<Id>");
+    assert.strictEqual(comicItem.id, "测试漫画@@book:123", "列表卡片 ID 必须统一格式化为 <Title>@@book:<Id>");
     assert.strictEqual(comicItem.title, "测试漫画");
     assert.strictEqual(comicItem.subTitle, "25 话");
     assert.strictEqual(comicItem.description, "共 25 话 · 更新: 2026-09-06");
@@ -3471,12 +3472,12 @@ async function runTests() {
     assert.strictEqual(details.subId, String(bookId));
   });
 
-  await test("56. 新列表/发现/历史/搜索输出全部为 book:<正整数>，严格校验代表 Book.Id", async () => {
+  await test("56. 新列表/发现/历史/搜索输出全部为 <Title>@@book:<正整数>，严格校验代表 Book.Id", async () => {
     const { source } = createSourceHarness();
 
     // 1. _comicFromListItem 校验有效与无效 Id
     const valid = source._comicFromListItem({ Id: 9527, Title: "有效漫画" });
-    assert.strictEqual(valid.id, "book:9527");
+    assert.strictEqual(valid.id, "有效漫画@@book:9527");
     assert.strictEqual(valid.title, "有效漫画");
 
     for (const badId of [null, undefined, 0, -1, NaN, "abc", Infinity]) {
@@ -3499,8 +3500,8 @@ async function runTests() {
       TotalPages: 2,
     };
     const listRes = source._comicListFromResponse(listData);
-    assert.strictEqual(listRes.comics[0].id, "book:101");
-    assert.strictEqual(listRes.comics[1].id, "book:102");
+    assert.strictEqual(listRes.comics[0].id, "列表1@@book:101");
+    assert.strictEqual(listRes.comics[1].id, "列表2@@book:102");
 
     // 3. _historyComicsFromResponse (阅读历史输出)
     const seen = new Set();
@@ -3508,8 +3509,8 @@ async function runTests() {
       { Data: [{ Id: 201, Title: "历史1" }] },
       seen,
     );
-    assert.strictEqual(historyRes[0].id, "book:201");
-    assert.ok(seen.has("book:201"));
+    assert.strictEqual(historyRes[0].id, "历史1@@book:201");
+    assert.ok(seen.has("历史1@@book:201"));
 
     // 4. search.load 输出
     source._hubCall = async (target, params) => {
@@ -3522,7 +3523,7 @@ async function runTests() {
       throw new Error(`Unexpected call: ${target}`);
     };
     const searchRes = await source.search.load("关键词", ["fuzzy"], 1);
-    assert.strictEqual(searchRes.comics[0].id, "book:301");
+    assert.strictEqual(searchRes.comics[0].id, "搜索1@@book:301");
   });
 
   await test("57. legacy 恢复从官方 GetReadHistory 按 24 本分片串行恢复并严格验证", async () => {
@@ -3693,6 +3694,124 @@ async function runTests() {
       "legacy 标题仍应权威打开原代表 Book 100",
     );
     assert.strictEqual(legacyDetails.subId, "100");
+  });
+
+  await test("60. 宿主安全回归：latest/popular/history/search 宿主安全卡片与零搜索直连加载、旧标题恢复与 recommend 兼容", async () => {
+    const { source } = createSourceHarness();
+    const calls = [];
+    let searchCalled = false;
+
+    source._hubCall = async (target, params) => {
+      calls.push({ target, params });
+      if (target === "GetComicList") {
+        if (params.Order === "latest") {
+          return {
+            Data: [{ Id: 1101, Title: "最新更新漫画", Count: 10 }],
+            TotalPages: 1,
+          };
+        }
+        if (params.Order === "view") {
+          return {
+            Data: [{ Id: 1102, Title: "热门榜单漫画", Count: 20 }],
+            TotalPages: 1,
+          };
+        }
+      }
+      if (target === "GetReadHistory") {
+        return {
+          Comic: [1103],
+        };
+      }
+      if (target === "GetBookListByIds") {
+        return {
+          Data: [{ Id: 1103, Title: "阅读历史漫画", Count: 30 }],
+        };
+      }
+      if (target === "SearchComicSeries") {
+        searchCalled = true;
+        if (params.KeyWords === "搜索测试") {
+          return {
+            Data: [{ Id: 1104, Title: "搜索测试漫画", Count: 40 }],
+            TotalPages: 1,
+          };
+        }
+        if (params.KeyWords === "纯标题旧漫") {
+          return {
+            Data: [{ Id: 1105, Title: "纯标题旧漫", Count: 50 }],
+            TotalPages: 1,
+          };
+        }
+        return { Data: [], TotalPages: 0 };
+      }
+      if (target === "GetBookInfo") {
+        const id = params.Id;
+        return {
+          SeriesTitle: id === 1105 ? "纯标题旧漫" : `系列_${id}`,
+          Book: {
+            Id: id,
+            Type: "Comic",
+            Title: id === 1105 ? "纯标题旧漫" : `单行本_${id}`,
+            Chapters: [{ Id: id * 10, Title: "第一话" }],
+          },
+          Series: [
+            { Id: id, Title: id === 1105 ? "纯标题旧漫" : `单行本_${id}` },
+            { Id: 9999, Title: "同系列相关卷" },
+          ],
+        };
+      }
+      throw new Error(`未模拟的 hub 调用: ${target}`);
+    };
+
+    // 1. latest / popular / reading history / search 全部返回非空且为宿主安全格式的卡片
+    const latestRes = await source.categoryComics.load("最近更新", "latest", null, 1);
+    assert.strictEqual(latestRes.comics.length, 1);
+    assert.strictEqual(latestRes.comics[0].id, "最新更新漫画@@book:1101");
+    assert.strictEqual(latestRes.comics[0].title, "最新更新漫画");
+
+    const popularRes = await source.categoryComics.load("热门漫画", "view", null, 1);
+    assert.strictEqual(popularRes.comics.length, 1);
+    assert.strictEqual(popularRes.comics[0].id, "热门榜单漫画@@book:1102");
+    assert.strictEqual(popularRes.comics[0].title, "热门榜单漫画");
+
+    const historyRes = await source.categoryComics.load("阅读历史", "history", null, 1);
+    assert.strictEqual(historyRes.comics.length, 1);
+    assert.strictEqual(historyRes.comics[0].id, "阅读历史漫画@@book:1103");
+    assert.strictEqual(historyRes.comics[0].title, "阅读历史漫画");
+
+    const searchRes = await source.search.load("搜索测试", ["fuzzy"], 1);
+    assert.strictEqual(searchRes.comics.length, 1);
+    assert.strictEqual(searchRes.comics[0].id, "搜索测试漫画@@book:1104");
+    assert.strictEqual(searchRes.comics[0].title, "搜索测试漫画");
+
+    // 2. 点击每个生成的卡片 ID：通过 GetBookInfo 直连加载，严禁调用 SearchComicSeries
+    searchCalled = false;
+    for (const card of [latestRes.comics[0], popularRes.comics[0], historyRes.comics[0], searchRes.comics[0]]) {
+      const details = await source.comic.loadInfo(card.id);
+      assert.ok(details, "必须成功返回详情");
+      assert.strictEqual(details.title, card.title ? `单行本_${source._parseDirectBookId(card.id)}` : "");
+      assert.strictEqual(details.subId, String(source._parseDirectBookId(card.id)));
+      assert.strictEqual(details.recommend.length, 1);
+      assert.strictEqual(details.recommend[0].id, "book:9999", "recommend 关联卡片必须维持 book:<id> 格式兼容");
+    }
+    assert.strictEqual(searchCalled, false, "直连卡片 ID 打开时绝不得触发任何搜索");
+
+    // 3. 打开纯标题旧历史 ID：无 @@book: 后缀，必须通过 legacy 检索恢复并成功打开
+    searchCalled = false;
+    const legacyDetails = await source.comic.loadInfo("纯标题旧漫");
+    assert.ok(legacyDetails);
+    assert.strictEqual(legacyDetails.title, "纯标题旧漫");
+    assert.strictEqual(legacyDetails.subId, "1105");
+    assert.strictEqual(searchCalled, true, "旧标题 ID 必须走 legacy 搜索恢复流程");
+
+    // 4. recommend 卡片 (book:9999) 直连打开：完全兼容且不调用搜索
+    searchCalled = false;
+    const recommendDetails = await source.comic.loadInfo("book:9999");
+    assert.ok(recommendDetails);
+    assert.strictEqual(recommendDetails.subId, "9999");
+    assert.strictEqual(searchCalled, false, "recommend 的 book:<id> 格式必须保持零搜索直接打开");
+
+    // 5. 版本断言强一致
+    assert.strictEqual(source.version, "0.4.1");
   });
 
   assert.strictEqual(

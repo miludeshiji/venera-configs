@@ -390,8 +390,8 @@ async function runSmoke() {
     }
     console.log(`  ✓ refresh 成功, SessionToken 长度: ${sessionToken.length}`);
 
-    // 2. 测试 latest / view 列表与 book:<Id> 卡片格式
-    console.log("\n[2/9] 验证 GetComicList (latest & view) 原始项与 book:<Id> 卡片身份...");
+    // 2. 测试 latest / view 列表与 <Title>@@book:<Id> 宿主安全卡片格式
+    console.log("\n[2/9] 验证 GetComicList (latest & view) 原始项与 <Title>@@book:<Id> 宿主安全卡片身份...");
     const [rawLatestResp, rawViewResp] = await Promise.all([
       source._hubCall(
         "GetComicList",
@@ -416,7 +416,7 @@ async function runSmoke() {
     const rawFirstTitle = String(
       source._value(rawFirstItem, "title", "Title", "") || "",
     ).trim();
-    const expectedDirectId = `book:${rawFirstId}`;
+    const expectedDirectId = `${rawFirstTitle}@@book:${rawFirstId}`;
 
     const latest = source._comicListFromResponse(rawLatestResp);
     const view = source._comicListFromResponse(rawViewResp);
@@ -438,7 +438,7 @@ async function runSmoke() {
       `  ✓ view 漫画数量: ${view.comics.length}, 样例: “${view.comics[0].title}” (卡片 ID: ${view.comics[0].id})`,
     );
 
-    // 3. direct ID 冷启动加载（清空标题映射后用 book:<Id> 加载，断言坚决不发起搜索）
+    // 3. direct ID 冷启动加载（清空标题映射后用 <Title>@@book:<Id> 加载，断言坚决不发起搜索）
     console.log(
       `\n[3/9] 验证 direct ID (${expectedDirectId}) 冷启动加载（断言坚决不发起搜索）...`,
     );
