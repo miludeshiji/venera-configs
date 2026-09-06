@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.4.1
+ * 版本：0.4.2
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -49,7 +49,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.4.1";
+  version = "0.4.2";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -2670,28 +2670,116 @@ class LightNovelShelf extends ComicSource {
     }
   }
 
+  _normalizeTitle(title) {
+    if (title == null) return "";
+    let s = String(title).trim();
+    if (!s) return "";
+    if (typeof s.normalize === "function") {
+      s = s.normalize("NFKC");
+    }
+    s = s.toLowerCase();
+    // 忽略常见标题标点与空白差异，不进行子串/模糊匹配
+    const stripped = s.replace(
+      /[\s\-_—–―~～:：·・•.。,，、!！?？'"“”‘’`《》〈〉（）()[\]{}【】「」『』/\\#@&+=*^%$]+/g,
+      "",
+    );
+    return stripped || s.replace(/\s+/g, " ").trim();
+  }
+
+  _extractListItemTitles(item) {
+    if (!item || typeof item !== "object") return [];
+    const titles = new Set();
+    const t1 = this._value(item, "title", "Title", "");
+    if (t1) titles.add(String(t1).trim());
+    const t2 = this._value(item, "originalTitle", "OriginalTitle", "");
+    if (t2) titles.add(String(t2).trim());
+    const t3 = this._value(item, "seriesTitle", "SeriesTitle", "");
+    if (t3) titles.add(String(t3).trim());
+    return Array.from(titles).filter(Boolean);
+  }
+
+  _extractBookInfoTitles(info, candidateBookId) {
+    if (!info || typeof info !== "object") return [];
+    const titles = new Set();
+    const seriesTitle = this._value(info, "seriesTitle", "SeriesTitle", "");
+    if (seriesTitle) titles.add(String(seriesTitle).trim());
+
+    const bookObj = this._value(info, "book", "Book", info);
+    if (bookObj && typeof bookObj === "object") {
+      const bookTitle = this._value(bookObj, "title", "Title", "");
+      if (bookTitle) titles.add(String(bookTitle).trim());
+
+      let extra = this._value(bookObj, "extra", "Extra", null);
+      if (typeof extra === "string" && extra.trim().startsWith("{")) {
+        try {
+          extra = JSON.parse(extra);
+        } catch (_) {}
+      }
+      const classification =
+        (extra && (extra.classification || extra.Classification)) ||
+        bookObj.classification ||
+        bookObj.Classification ||
+        info.classification ||
+        info.Classification ||
+        {};
+      const seriesName =
+        classification.series_name || classification.seriesName || "";
+      if (seriesName) titles.add(String(seriesName).trim());
+      const seriesNameCn =
+        classification.series_name_cn || classification.seriesNameCn || "";
+      if (seriesNameCn) titles.add(String(seriesNameCn).trim());
+    }
+
+    const series = this._value(info, "series", "Series", null);
+    if (Array.isArray(series)) {
+      const targetId = Number(candidateBookId);
+      for (const member of series) {
+        if (!member || typeof member !== "object") continue;
+        const memberId = Number(this._value(member, "id", "Id", NaN));
+        if (Number.isSafeInteger(targetId) && targetId > 0) {
+          if (memberId === targetId) {
+            const memberTitle = this._value(member, "title", "Title", "");
+            if (memberTitle) titles.add(String(memberTitle).trim());
+          }
+        } else {
+          const memberTitle = this._value(member, "title", "Title", "");
+          if (memberTitle) titles.add(String(memberTitle).trim());
+        }
+      }
+    }
+
+    return Array.from(titles).filter(Boolean);
+  }
+
+  _matchesNormalizedTitle(expectedTitle, candidateTitles) {
+    const normalizedExpected = this._normalizeTitle(expectedTitle);
+    if (!normalizedExpected) return false;
+    for (const title of candidateTitles || []) {
+      if (this._normalizeTitle(title) === normalizedExpected) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async _verifyCandidate(candidateBookId, expectedTitle) {
     const bookId = Number(candidateBookId);
     if (!Number.isSafeInteger(bookId) || bookId <= 0) return null;
-    const normalizedExpectedTitle = String(
-      expectedTitle == null ? "" : expectedTitle,
-    ).trim();
+    const normalizedExpectedTitle = this._normalizeTitle(expectedTitle);
     if (!normalizedExpectedTitle) return null;
 
     try {
       const info = await this._getBookInfo(bookId, "verify");
       const bookObj = this._value(info, "book", "Book", info);
       const type = String(this._value(bookObj, "type", "Type", ""));
-      const resolvedSeriesTitle = String(
-        this._value(info, "seriesTitle", "SeriesTitle", "") || "",
-      ).trim();
       const verifiedBookId = Number(this._value(bookObj, "id", "Id", NaN));
 
-      if (
-        verifiedBookId === bookId &&
-        type === "Comic" &&
-        resolvedSeriesTitle === normalizedExpectedTitle
-      ) {
+      if (verifiedBookId !== bookId || type !== "Comic") {
+        return null;
+      }
+
+      const authoritativeTitles = this._extractBookInfoTitles(info, bookId);
+      if (this._matchesNormalizedTitle(expectedTitle, authoritativeTitles)) {
         return { bookId: bookId, info: info };
       }
     } catch (err) {
@@ -2714,7 +2802,12 @@ class LightNovelShelf extends ComicSource {
       return null;
     }
 
+    const normalizedExpected = this._normalizeTitle(title);
+    if (!normalizedExpected) return null;
+
     const chunkSize = this.constructor.legacyHistoryChunkSize || 24;
+    const candidateMap = new Map();
+
     for (let i = 0; i < historyIds.length; i += chunkSize) {
       const chunk = historyIds.slice(i, i + chunkSize);
       if (chunk.length === 0) continue;
@@ -2729,23 +2822,41 @@ class LightNovelShelf extends ComicSource {
       );
       const items = this._value(data, "data", "Data", []);
       for (const item of Array.isArray(items) ? items : []) {
-        const itemTitle = String(
-          this._value(item, "title", "Title", "") || "",
-        ).trim();
-        if (itemTitle === title) {
+        const itemTitles = this._extractListItemTitles(item);
+        if (this._matchesNormalizedTitle(title, itemTitles)) {
           const candidateId = Number(this._value(item, "id", "Id", NaN));
-          if (Number.isSafeInteger(candidateId) && candidateId > 0) {
-            const verified = await this._verifyCandidate(candidateId, title);
-            if (verified) {
-              return {
-                bookId: candidateId,
-                item: item,
-                info: verified.info,
-              };
-            }
+          if (
+            Number.isSafeInteger(candidateId) &&
+            candidateId > 0 &&
+            !candidateMap.has(candidateId)
+          ) {
+            candidateMap.set(candidateId, item);
           }
         }
       }
+    }
+
+    if (candidateMap.size === 0) {
+      return null;
+    }
+
+    const verified = [];
+    for (const [candidateId, item] of candidateMap.entries()) {
+      const res = await this._verifyCandidate(candidateId, title);
+      if (res) {
+        verified.push({
+          bookId: candidateId,
+          item: item,
+          info: res.info,
+        });
+      }
+    }
+
+    if (verified.length === 1) {
+      return verified[0];
+    }
+    if (verified.length > 1) {
+      return null;
     }
     return null;
   }
@@ -2753,10 +2864,13 @@ class LightNovelShelf extends ComicSource {
   async _resolveFromSearch(title, apiBase, authGeneration) {
     const modes = ["title", "exact", "name", "fuzzy"];
     const maxPages = this.constructor.legacySearchMaxPagesPerMode || 3;
+    const normalizedExpected = this._normalizeTitle(title);
+    if (!normalizedExpected) return null;
 
     for (const mode of modes) {
       let page = 1;
       let totalPages = 1;
+      const candidateMap = new Map();
 
       while (page <= Math.min(totalPages, maxPages)) {
         const data = await this._hubCall(
@@ -2782,28 +2896,45 @@ class LightNovelShelf extends ComicSource {
 
         const items = this._value(data, "data", "Data", []);
         for (const item of Array.isArray(items) ? items : []) {
-          const itemTitle = String(
-            this._value(item, "title", "Title", "") || "",
-          ).trim();
-          if (itemTitle === title) {
+          const itemTitles = this._extractListItemTitles(item);
+          if (this._matchesNormalizedTitle(title, itemTitles)) {
             const candidateId = Number(this._value(item, "id", "Id", NaN));
-            if (Number.isSafeInteger(candidateId) && candidateId > 0) {
-              const verified = await this._verifyCandidate(candidateId, title);
-              if (verified) {
-                return {
-                  bookId: candidateId,
-                  item: item,
-                  mode: mode,
-                  info: verified.info,
-                };
-              }
+            if (
+              Number.isSafeInteger(candidateId) &&
+              candidateId > 0 &&
+              !candidateMap.has(candidateId)
+            ) {
+              candidateMap.set(candidateId, { item, mode });
             }
           }
         }
 
         page += 1;
       }
+
+      if (candidateMap.size > 0) {
+        const verified = [];
+        for (const [candidateId, entry] of candidateMap.entries()) {
+          const res = await this._verifyCandidate(candidateId, title);
+          if (res) {
+            verified.push({
+              bookId: candidateId,
+              item: entry.item,
+              mode: entry.mode,
+              info: res.info,
+            });
+          }
+        }
+
+        if (verified.length === 1) {
+          return verified[0];
+        }
+        if (verified.length > 1) {
+          return null;
+        }
+      }
     }
+
     return null;
   }
 
@@ -2898,8 +3029,8 @@ class LightNovelShelf extends ComicSource {
     // 5. 确定性无结果：坏持久映射继续保留，建立短时负缓存并抛出可操作诊断
     const diagMsg =
       badPersistentId !== null
-        ? `无法解析漫画“${title}”对应的 Book.Id（已保留旧持久映射 ${badPersistentId}，但其 GetBookInfo 校验未通过，且官方历史与有界搜索未发现严格匹配漫画）`
-        : `无法解析漫画“${title}”对应的 Book.Id（官方历史与有界搜索未发现严格匹配漫画）`;
+        ? `无法解析漫画“${title}”对应的 Book.Id（已保留旧持久映射 ${badPersistentId}，但其 GetBookInfo 校验未通过，且官方历史与有界搜索未发现唯一匹配漫画）`
+        : `无法解析漫画“${title}”对应的 Book.Id（官方历史与有界搜索未发现唯一匹配漫画）`;
     const notFoundError = new Error(diagMsg);
     notFoundError.code = "LIGHTNOVELSHELF_COMIC_NOT_FOUND";
     notFoundError.isDeterministicNotFound = true;
@@ -3245,7 +3376,12 @@ class LightNovelShelf extends ComicSource {
       ) || comicId,
     );
     if (!isDirectId) {
-      if (resolvedSeriesTitle !== String(comicId)) {
+      const authoritativeTitles = this._extractBookInfoTitles(
+        bookInfo,
+        resolvedBookId,
+      );
+      const isMatch = this._matchesNormalizedTitle(comicId, authoritativeTitles);
+      if (!isMatch) {
         const err = new Error("GetBookInfo 返回的 SeriesTitle 与请求不一致");
         err.code = "LIGHTNOVELSHELF_SERIES_TITLE_MISMATCH";
         err.isContractError = true;
@@ -3255,7 +3391,10 @@ class LightNovelShelf extends ComicSource {
         err.representativeBookId = bookId;
         throw err;
       }
-      this._rememberRepresentativeBookId(resolvedSeriesTitle, resolvedBookId);
+      this._rememberRepresentativeBookId(comicId, resolvedBookId);
+      if (resolvedSeriesTitle && resolvedSeriesTitle !== String(comicId)) {
+        this._rememberRepresentativeBookId(resolvedSeriesTitle, resolvedBookId);
+      }
     }
 
     return bookInfo;
@@ -3396,11 +3535,21 @@ class LightNovelShelf extends ComicSource {
   _comicListFromResponse(data) {
     const list = this._value(data, "data", "Data", []);
     const totalPages = this._value(data, "totalPages", "TotalPages", 1);
+    const comics = [];
+
+    for (const item of Array.isArray(list) ? list : []) {
+      try {
+        const comic = this._comicFromListItem(item);
+        if (comic && comic.id) {
+          comics.push(comic);
+        }
+      } catch (_) {
+        // 单个畸变记录静默跳过，绝不导致整页白屏
+      }
+    }
 
     return {
-      comics: (Array.isArray(list) ? list : []).map((item) =>
-        this._comicFromListItem(item),
-      ),
+      comics: comics,
       maxPage: Number(totalPages || 1),
     };
   }
@@ -3436,10 +3585,30 @@ class LightNovelShelf extends ComicSource {
   }
 
   _historyIdsFromResponse(data) {
-    const ids = this._value(data, "comic", "Comic", []);
-    if (!Array.isArray(ids)) return [];
+    const rawIds = this._value(data, "comic", "Comic", []);
+    if (!Array.isArray(rawIds)) return [];
 
-    return ids.filter((id) => Number.isSafeInteger(id) && id > 0);
+    const result = [];
+    const seen = new Set();
+    for (const raw of rawIds) {
+      let num = NaN;
+      if (typeof raw === "number" && Number.isSafeInteger(raw)) {
+        num = raw;
+      } else if (typeof raw === "string") {
+        const trimmed = raw.trim();
+        if (/^\d+$/.test(trimmed)) {
+          const parsed = Number(trimmed);
+          if (Number.isSafeInteger(parsed)) {
+            num = parsed;
+          }
+        }
+      }
+      if (num > 0 && !seen.has(num)) {
+        seen.add(num);
+        result.push(num);
+      }
+    }
+    return result;
   }
 
   _historyComicsFromResponse(data, seenSeries) {
@@ -3447,11 +3616,15 @@ class LightNovelShelf extends ComicSource {
     const comics = [];
 
     for (const item of Array.isArray(list) ? list : []) {
-      const comic = this._comicFromListItem(item);
-      if (!comic.id || seenSeries.has(comic.id)) continue;
+      try {
+        const comic = this._comicFromListItem(item);
+        if (!comic || !comic.id || seenSeries.has(comic.id)) continue;
 
-      seenSeries.add(comic.id);
-      comics.push(comic);
+        seenSeries.add(comic.id);
+        comics.push(comic);
+      } catch (_) {
+        // 单个畸变记录跳过
+      }
     }
 
     return comics;
@@ -3837,10 +4010,20 @@ class LightNovelShelf extends ComicSource {
       const list = this._value(data, "data", "Data", []);
       const totalPages = this._value(data, "totalPages", "TotalPages", 1);
 
+      const comics = [];
+      for (const x of Array.isArray(list) ? list : []) {
+        try {
+          const comic = this._comicFromListItem(x);
+          if (comic && comic.id) {
+            comics.push(comic);
+          }
+        } catch (_) {
+          // 单个畸变记录跳过
+        }
+      }
+
       return {
-        comics: (Array.isArray(list) ? list : []).map((x) =>
-          this._comicFromListItem(x),
-        ),
+        comics: comics,
         maxPage: Number(totalPages || 1),
       };
     },

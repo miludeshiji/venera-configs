@@ -65,6 +65,7 @@
  * 58. 确定性无结果建立短时负缓存且同标题并发共享 Promise 单飞，登出/清理重置负缓存
  * 59. 打开 direct 相关书 book:<id> 不得改写 SeriesTitle 代表映射，旧标题收藏与记忆仍打开原代表 Book
  * 60. 宿主安全回归：latest/popular/history/search 宿主安全卡片与零搜索直连加载、旧标题恢复与 recommend 兼容
+ * 61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）
  */
 
 const fs = require("node:fs");
@@ -2311,7 +2312,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.4.1");
+    assert.strictEqual(source.version, "0.4.2");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -3811,7 +3812,222 @@ async function runTests() {
     assert.strictEqual(searchCalled, false, "recommend 的 book:<id> 格式必须保持零搜索直接打开");
 
     // 5. 版本断言强一致
-    assert.strictEqual(source.version, "0.4.1");
+    assert.strictEqual(source.version, "0.4.2");
+  });
+
+  await test("61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. 字符串数字历史 ID 解析与有序去重
+    const rawHistory = {
+      Comic: ["17395", 17395, "18001", "invalid", -5, 0, " 18001 "],
+    };
+    const parsedHistoryIds = source._historyIdsFromResponse(rawHistory);
+    assert.deepStrictEqual(
+      JSON.parse(JSON.stringify(parsedHistoryIds)),
+      [17395, 18001],
+      "必须支持正整数字符串 ID 并保持顺序去重",
+    );
+
+    // 2. 畸变列表项容错：单个畸变记录绝不使 categoryComics / search / history 白屏
+    source._hubCall = async (target, params) => {
+      if (target === "GetComicList") {
+        return {
+          Data: [
+            { Id: 101, Title: "正常漫画1" },
+            { Id: null, Title: "坏漫画-无ID" },
+            { Id: -1, Title: "坏漫画-负ID" },
+            { Id: 102, Title: "" },
+            { Id: 103, Title: "正常漫画2" },
+          ],
+          TotalPages: 5,
+        };
+      }
+      if (target === "SearchComicSeries") {
+        return {
+          Data: [
+            { Id: 201, Title: "搜索正常漫画" },
+            { Id: "invalid", Title: "坏搜索漫画" },
+          ],
+          TotalPages: 3,
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const categoryRes = await source.categoryComics.load(
+      "热门漫画",
+      "view",
+      null,
+      1,
+    );
+    assert.strictEqual(categoryRes.maxPage, 5);
+    assert.strictEqual(categoryRes.comics.length, 2);
+    assert.strictEqual(categoryRes.comics[0].title, "正常漫画1");
+    assert.strictEqual(categoryRes.comics[1].title, "正常漫画2");
+
+    const searchRes = await source.search.load("测试", {}, 1);
+    assert.strictEqual(searchRes.maxPage, 3);
+    assert.strictEqual(searchRes.comics.length, 1);
+    assert.strictEqual(searchRes.comics[0].title, "搜索正常漫画");
+
+    const historySeen = new Set();
+    const historyComics = source._historyComicsFromResponse(
+      {
+        Data: [
+          { Id: 301, Title: "历史正常漫画" },
+          { Id: 302, Title: "" },
+        ],
+      },
+      historySeen,
+    );
+    assert.strictEqual(historyComics.length, 1);
+    assert.strictEqual(historyComics[0].title, "历史正常漫画");
+
+    // 3. docs/log.txt 真实场景 A：旧持久映射 17395，SeriesTitle 与请求不同（今際の国のアリス vs 弥留之国的爱丽丝），通过 classification.series_name_cn 权威别名显式匹配
+    source._clearComicContentStates();
+    source._setPersistentSeriesBookId("弥留之国的爱丽丝", 17395);
+
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        if (params.Id === 17395) {
+          return {
+            SeriesTitle: "今際の国のアリス",
+            Series: [{ Id: 17395, Title: "今際の国のアリス 第01卷" }],
+            Book: {
+              Id: 17395,
+              Type: "Comic",
+              Title: "今際の国のアリス 01",
+              Extra: {
+                Classification: {
+                  series_name: "今際の国のアリス",
+                  series_name_cn: "弥留之国的爱丽丝",
+                },
+              },
+              Chapters: [{ Id: 1701, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const aliceDetails = await source.comic.loadInfo("弥留之国的爱丽丝");
+    assert.ok(aliceDetails);
+    assert.strictEqual(aliceDetails.subId, "17395");
+    // 验证二次打开直接命中内存缓存，且原 legacy 标题已缓存
+    assert.strictEqual(
+      source._seriesRepresentativeBookIds.get(
+        source._seriesCacheKey("弥留之国的爱丽丝", source.apiBase, source._authGeneration),
+      ),
+      17395,
+    );
+
+    // 4. docs/log.txt 真实场景 B：无持久映射的旧标题通过权威别名（OriginalTitle / Series 成员标题）成功检索恢复
+    source._clearComicContentStates();
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        if (params.KeyWords === "寄宿学校的朱丽叶") {
+          return {
+            Data: [
+              {
+                Id: 18001,
+                Title: "寄宿学校のジュリエット",
+                OriginalTitle: "寄宿学校的朱丽叶",
+              },
+            ],
+            TotalPages: 1,
+          };
+        }
+      }
+      if (target === "GetBookInfo") {
+        if (params.Id === 18001) {
+          return {
+            SeriesTitle: "寄宿学校のジュリエット",
+            Series: [{ Id: 18001, Title: "寄宿学校的朱丽叶" }],
+            Book: {
+              Id: 18001,
+              Type: "Comic",
+              Title: "寄宿学校的朱丽叶 第1卷",
+              Chapters: [{ Id: 1801, SortNum: 1, Title: "第1话" }],
+            },
+          };
+        }
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    const julietDetails = await source.comic.loadInfo("寄宿学校的朱丽叶");
+    assert.ok(julietDetails);
+    assert.strictEqual(julietDetails.subId, "18001");
+    assert.strictEqual(
+      source._getPersistentSeriesBookId("寄宿学校的朱丽叶"),
+      18001,
+    );
+
+    // 5. 歧义多重匹配安全拒绝：两部不同 Book.Id 均精确匹配时，坚决拒绝猜谜，抛出确定性未发现错误
+    source._clearComicContentStates();
+    source._hubCall = async (target, params) => {
+      if (target === "SearchComicSeries") {
+        return {
+          Data: [
+            { Id: 5001, Title: "歧义漫画" },
+            { Id: 5002, Title: "歧义漫画" },
+          ],
+          TotalPages: 1,
+        };
+      }
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "歧义漫画",
+          Series: [{ Id: params.Id, Title: "歧义漫画" }],
+          Book: {
+            Id: params.Id,
+            Type: "Comic",
+            Title: "歧义漫画",
+            Chapters: [{ Id: 50001, SortNum: 1, Title: "第1话" }],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    let ambiguousErr = null;
+    try {
+      await source.comic.loadInfo("歧义漫画");
+    } catch (err) {
+      ambiguousErr = err;
+    }
+    assert.ok(ambiguousErr, "多部 Book 匹配时必须拒绝猜谜并抛出错误");
+    assert.strictEqual(ambiguousErr.isDeterministicNotFound, true);
+    assert.match(ambiguousErr.message, /无法解析漫画“歧义漫画”对应的 Book\.Id/);
+
+    // 6. 无关项目严格拒绝：完全不相干的标题在 _loadBookDetails 与解析中保持拒绝
+    source._clearComicContentStates();
+    source._hubCall = async (target, params) => {
+      if (target === "GetBookInfo") {
+        return {
+          SeriesTitle: "完全无关漫画",
+          Series: [{ Id: params.Id, Title: "完全无关漫画" }],
+          Book: {
+            Id: params.Id,
+            Type: "Comic",
+            Title: "完全无关漫画",
+            Chapters: [],
+          },
+        };
+      }
+      throw new Error(`Unexpected call: ${target}`);
+    };
+
+    let mismatchErr = null;
+    try {
+      await source._loadBookDetails("测试标题", 9999, false);
+    } catch (err) {
+      mismatchErr = err;
+    }
+    assert.ok(mismatchErr);
+    assert.strictEqual(mismatchErr.isSeriesTitleMismatch, true);
   });
 
   assert.strictEqual(
