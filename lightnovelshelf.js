@@ -1,7 +1,7 @@
 /**
  * 轻书架 (LightNovelShelf) for Venera / VeneraNext
  *
- * 版本：0.4.3
+ * 版本：0.4.4
  *
  * 实现：
  * - ASP.NET Core SignalR JSON Hub Protocol
@@ -17,6 +17,7 @@
  * - 稳定 <Title>@@book:<id> 漫画身份模型 / 旧 SeriesTitle 通过官方历史与有界搜索安全恢复 / direct ID 直连跳过搜索
  * - 发现页多区块容错独立 settle / 正文 BookId 回填与阅读进度同步
  * - BookInfo TTL (60s) 缓存与容量淘汰 (64)
+ * - 阅读器按 Target（logicalWidth/logicalHeight/devicePixelRatio/fit）自适应计算尺寸，按 256 阶梯量化与 256..4096 范围安全裁剪
  * 使用前：
  * 1. 邮箱登录：在 Venera 账号区域输入轻书架邮箱和密码。
  * 2. Token 登录：点击源设置底部的“Token 登录”，输入 RefreshToken|x-id。
@@ -49,7 +50,7 @@ class LightNovelShelf extends ComicSource {
 
   name = "轻书架";
   key = "LightNovelShelf";
-  version = "0.4.3";
+  version = "0.4.4";
   minAppVersion = "2.0.2";
   // 如果以后把本文件放到 GitHub，可改为 raw 文件地址用于在线更新。
   url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/lightnovelshelf.js";
@@ -2103,6 +2104,201 @@ class LightNovelShelf extends ComicSource {
       throw new Error("无效轻书架章节图片键");
     }
     return { chapterId: chapterId, page: page };
+  }
+
+  _parseSystemImageSize(url) {
+    if (typeof url !== "string" || !url) {
+      return null;
+    }
+
+    const hashIdx = url.indexOf("#");
+    const urlBeforeHash = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+    const qIdx = urlBeforeHash.indexOf("?");
+    if (qIdx === -1) {
+      return null;
+    }
+
+    const query = urlBeforeHash.slice(qIdx + 1);
+    const pairs = query.split("&");
+    for (const pair of pairs) {
+      if (!pair) continue;
+      const eqIdx = pair.indexOf("=");
+      const key = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair;
+      if (key === "size") {
+        const value = eqIdx >= 0 ? pair.slice(eqIdx + 1) : "";
+        const match = value.match(/^([1-9]\d*)x([1-9]\d*)$/i);
+        if (!match) {
+          return null;
+        }
+        const width = Number(match[1]);
+        const height = Number(match[2]);
+        if (
+          Number.isSafeInteger(width) &&
+          width > 0 &&
+          Number.isSafeInteger(height) &&
+          height > 0
+        ) {
+          return { width: width, height: height };
+        }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  _getReaderDisplayHeight(sourceWidth, sourceHeight, target) {
+    if (!target || typeof target !== "object" || Array.isArray(target)) {
+      return null;
+    }
+
+    const dpr = target.devicePixelRatio;
+    if (typeof dpr !== "number" || !Number.isFinite(dpr) || dpr <= 0) {
+      return null;
+    }
+
+    if (
+      typeof sourceWidth !== "number" ||
+      !Number.isFinite(sourceWidth) ||
+      sourceWidth <= 0 ||
+      typeof sourceHeight !== "number" ||
+      !Number.isFinite(sourceHeight) ||
+      sourceHeight <= 0
+    ) {
+      return null;
+    }
+
+    const fit = target.fit;
+    if (fit === "contain") {
+      const lw = target.logicalWidth;
+      const lh = target.logicalHeight;
+      if (
+        typeof lw !== "number" ||
+        !Number.isFinite(lw) ||
+        lw <= 0 ||
+        typeof lh !== "number" ||
+        !Number.isFinite(lh) ||
+        lh <= 0
+      ) {
+        return null;
+      }
+      return Math.min(lw * (sourceHeight / sourceWidth), lh);
+    }
+
+    if (fit === "fitWidth") {
+      const lw = target.logicalWidth;
+      if (typeof lw !== "number" || !Number.isFinite(lw) || lw <= 0) {
+        return null;
+      }
+      return lw * (sourceHeight / sourceWidth);
+    }
+
+    if (fit === "fitHeight") {
+      const lh = target.logicalHeight;
+      if (typeof lh !== "number" || !Number.isFinite(lh) || lh <= 0) {
+        return null;
+      }
+      return lh;
+    }
+
+    return null;
+  }
+
+  _imageHeightBucketFor(pixelHeight) {
+    if (
+      typeof pixelHeight !== "number" ||
+      !Number.isFinite(pixelHeight) ||
+      pixelHeight <= 0
+    ) {
+      return null;
+    }
+
+    const rounded = Math.round(pixelHeight / 256) * 256;
+    if (rounded < 256) {
+      return 256;
+    }
+    if (rounded > 4096) {
+      return 4096;
+    }
+    return rounded;
+  }
+
+  _withImageHeight(url, height) {
+    if (
+      typeof url !== "string" ||
+      !url ||
+      typeof height !== "number" ||
+      !Number.isInteger(height) ||
+      height < 256 ||
+      height > 4096 ||
+      height % 256 !== 0
+    ) {
+      return url;
+    }
+
+    const hashIdx = url.indexOf("#");
+    const rawFragment = hashIdx >= 0 ? url.slice(hashIdx) : "";
+    const urlBeforeHash = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+
+    const qIdx = urlBeforeHash.indexOf("?");
+    const base = qIdx >= 0 ? urlBeforeHash.slice(0, qIdx) : urlBeforeHash;
+    const rawQuery = qIdx >= 0 ? urlBeforeHash.slice(qIdx + 1) : null;
+
+    if (rawQuery === null || rawQuery === "") {
+      return `${base}?height=${height}${rawFragment}`;
+    }
+
+    const rawPairs = rawQuery.split("&");
+    let heightInserted = false;
+    const newPairs = [];
+
+    for (const pair of rawPairs) {
+      if (pair === "") continue;
+      const eqIdx = pair.indexOf("=");
+      const key = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair;
+      if (key === "height") {
+        if (!heightInserted) {
+          newPairs.push(`height=${height}`);
+          heightInserted = true;
+        }
+      } else {
+        newPairs.push(pair);
+      }
+    }
+
+    if (!heightInserted) {
+      newPairs.push(`height=${height}`);
+    }
+
+    return `${base}?${newPairs.join("&")}${rawFragment}`;
+  }
+
+  _applyReaderImageTarget(url, target) {
+    if (typeof url !== "string" || !url || !target) {
+      return url;
+    }
+
+    const sourceSize = this._parseSystemImageSize(url);
+    if (!sourceSize) {
+      return url;
+    }
+
+    const displayHeight = this._getReaderDisplayHeight(
+      sourceSize.width,
+      sourceSize.height,
+      target,
+    );
+    if (displayHeight === null) {
+      return url;
+    }
+
+    const dpr = target.devicePixelRatio;
+    const pixelHeight = displayHeight * dpr;
+    const bucketedHeight = this._imageHeightBucketFor(pixelHeight);
+    if (bucketedHeight === null) {
+      return url;
+    }
+
+    return this._withImageHeight(url, bucketedHeight);
   }
 
   _clearComicContentStates() {
@@ -4555,14 +4751,15 @@ class LightNovelShelf extends ComicSource {
       return "ok";
     },
 
-    onImageLoad: async (url, comicId, epId) => {
+    onImageLoad: async (url, comicId, epId, target) => {
       const headers = {
         "User-Agent": this.userAgent,
         Referer: this.siteBase + "/",
       };
       const reference = this._parseComicPageKey(url);
       if (!reference) {
-        return { url: url, headers: headers };
+        const directUrl = this._applyReaderImageTarget(url, target);
+        return { url: directUrl, headers: headers };
       }
 
       const chapterId = this._comicChapterId(epId);
@@ -4587,7 +4784,8 @@ class LightNovelShelf extends ComicSource {
       if (!actualUrl) {
         throw new Error("轻书架章节图片页码越界");
       }
-      return { url: actualUrl, headers: headers };
+      const finalUrl = this._applyReaderImageTarget(actualUrl, target);
+      return { url: finalUrl, headers: headers };
     },
 
     onThumbnailLoad: (url) => {

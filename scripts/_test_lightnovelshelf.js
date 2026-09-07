@@ -67,6 +67,8 @@
  * 60. 宿主安全回归：latest/popular/history/search 宿主安全卡片与零搜索直连加载、旧标题恢复与 recommend 兼容
  * 61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）
  * 62. 列表契约硬化：Base64 编码串/缺失 Data 拒绝、全无效条目抛错、混合有效条目过滤、合法空列表、无效总页数降级与 search/category 共享路径防御
+ * 63. 阅读器 Target 图片尺寸解析与 URL 改写：查询串边界、contain/fitWidth/fitHeight 几何计算、256 阶梯量化与 256..4096 裁剪、URL 增改与去重及 fragment 保留
+ * 64. comic.onImageLoad 目标尺寸集成：直连与实际 URL 适配、Target 容错降级、保留 Take=6 分批与请求头及 onThumbnailLoad 行为不变
  */
 
 const fs = require("node:fs");
@@ -2330,7 +2332,7 @@ async function runTests() {
     assert.strictEqual(source.name, "轻书架");
     assert.strictEqual(source.key, "LightNovelShelf");
     assert.match(source.key, /^[a-zA-Z0-9_]+$/);
-    assert.strictEqual(source.version, "0.4.3");
+    assert.strictEqual(source.version, "0.4.4");
     assert.strictEqual(source.minAppVersion, "2.0.2");
 
     const indexPath = path.resolve(__dirname, "../index.json");
@@ -3830,7 +3832,7 @@ async function runTests() {
     assert.strictEqual(searchCalled, false, "recommend 的 book:<id> 格式必须保持零搜索直接打开");
 
     // 5. 版本断言强一致
-    assert.strictEqual(source.version, "0.4.3");
+    assert.strictEqual(source.version, "0.4.4");
   });
 
   await test("61. 修复回归：docs/log.txt 真实场景（别名/分类映射恢复、无图谱搜索别名、歧义拒绝、字符串历史ID、畸变容错与无二次MISMATCH）", async () => {
@@ -4183,6 +4185,455 @@ async function runTests() {
     }
     assert.ok(categoryFailedErr, "编码字符串未解析时 categoryComics 必须抛错");
     assert.match(categoryFailedErr.message, /轻书架漫画列表响应格式异常/);
+  });
+
+  await test("63. 阅读器 Target 图片尺寸解析与 URL 改写：查询串边界、contain/fitWidth/fitHeight 几何计算、256 阶梯量化与 256..4096 裁剪、URL 增改与去重及 fragment 保留", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. _parseSystemImageSize：只解析查询参数（fragment 之前）size=WxH，要求正有限数值
+    assert.deepStrictEqual(
+      JSON.parse(
+        JSON.stringify(
+          source._parseSystemImageSize("https://example.com/image.jpg?size=800x1200"),
+        ),
+      ),
+      { width: 800, height: 1200 },
+    );
+    assert.deepStrictEqual(
+      JSON.parse(
+        JSON.stringify(
+          source._parseSystemImageSize(
+            "https://example.com/image.jpg?token=abc&size=1080x1920&format=webp",
+          ),
+        ),
+      ),
+      { width: 1080, height: 1920 },
+    );
+    // 小数格式尺寸必须被拒绝（要求正整数x正整数）
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg?size=1080.5x1920.5"),
+      null,
+      "小数格式尺寸必须被拒绝",
+    );
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg?size=1080x1920.5"),
+      null,
+    );
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg?size=1080.5x1920"),
+      null,
+    );
+    // 路径中出现 size=WxH 不得解析
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/size=800x1200/image.jpg"),
+      null,
+    );
+    // fragment 中出现 size=WxH 不得解析
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg#size=800x1200"),
+      null,
+    );
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg?foo=1#size=800x1200"),
+      null,
+    );
+    // 非 exact key (如 othersize) 不得解析
+    assert.strictEqual(
+      source._parseSystemImageSize("https://example.com/image.jpg?othersize=800x1200"),
+      null,
+    );
+    // 0、负数、非数值及畸变格式拒绝
+    for (const badUrl of [
+      "https://example.com/image.jpg?size=0x1200",
+      "https://example.com/image.jpg?size=-800x1200",
+      "https://example.com/image.jpg?size=800x0",
+      "https://example.com/image.jpg?size=800",
+      "https://example.com/image.jpg?size=800x",
+      "https://example.com/image.jpg?size=x1200",
+      "https://example.com/image.jpg?size=800x1200px",
+      "https://example.com/image.jpg?size=NaNxNaN",
+      "https://example.com/image.jpg",
+      "",
+      null,
+      undefined,
+    ]) {
+      assert.strictEqual(
+        source._parseSystemImageSize(badUrl),
+        null,
+        `无效 URL/size ${badUrl} 必须解析为 null`,
+      );
+    }
+
+    // 2. _getReaderDisplayHeight：contain/fitWidth/fitHeight 几何计算与严格 target 校验
+    // contain: 宽高比与容器双维度 min 约束
+    // 高长型图片 (1000x2000) 在 500x1500 视口中，缩放因子 min(500/1000, 1500/2000) = 0.5 -> 显示高度 1000
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "contain",
+        logicalWidth: 500,
+        logicalHeight: 1500,
+        devicePixelRatio: 2,
+      }),
+      1000,
+    );
+    // 宽长型图片 (2000x1000) 在 500x1500 视口中，缩放因子 min(500/2000, 1500/1000) = 0.25 -> 显示高度 250
+    assert.strictEqual(
+      source._getReaderDisplayHeight(2000, 1000, {
+        fit: "contain",
+        logicalWidth: 500,
+        logicalHeight: 1500,
+        devicePixelRatio: 2,
+      }),
+      250,
+    );
+    // contain 缺少任一必要维度返回 null
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "contain",
+        logicalWidth: 500,
+        devicePixelRatio: 2,
+      }),
+      null,
+    );
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "contain",
+        logicalHeight: 1500,
+        devicePixelRatio: 2,
+      }),
+      null,
+    );
+
+    // fitWidth: logicalWidth 结合源图比例计算，logicalHeight 可省略
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "fitWidth",
+        logicalWidth: 500,
+        devicePixelRatio: 2,
+      }),
+      1000,
+    );
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "fitWidth",
+        devicePixelRatio: 2,
+      }),
+      null,
+    );
+
+    // fitHeight: 验证源图宽高后返回 logicalHeight，logicalWidth 可省略
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "fitHeight",
+        logicalHeight: 800,
+        devicePixelRatio: 2,
+      }),
+      800,
+    );
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "fitHeight",
+        devicePixelRatio: 2,
+      }),
+      null,
+    );
+
+    // 原图尺寸非法校验（contain/fitWidth/fitHeight 均需要源尺寸合法）
+    for (const [sw, sh] of [[0, 2000], [1000, 0], [-100, 2000], [1000, -100], [NaN, 2000], [null, 2000]]) {
+      assert.strictEqual(
+        source._getReaderDisplayHeight(sw, sh, {
+          fit: "fitHeight",
+          logicalHeight: 800,
+          devicePixelRatio: 2,
+        }),
+        null,
+      );
+    }
+
+    // target 校验：null、非对象、数组、无效 DPR、未知 fit 拒绝
+    for (const badTarget of [
+      null,
+      undefined,
+      "not-object",
+      [1, 2, 3],
+      { fit: "unknown", logicalWidth: 500, logicalHeight: 500, devicePixelRatio: 1 },
+      { fit: "fitWidth", logicalWidth: 500, devicePixelRatio: 0 },
+      { fit: "fitWidth", logicalWidth: 500, devicePixelRatio: -1 },
+      { fit: "fitWidth", logicalWidth: 500, devicePixelRatio: NaN },
+      { fit: "fitWidth", logicalWidth: 500, devicePixelRatio: null },
+    ]) {
+      assert.strictEqual(
+        source._getReaderDisplayHeight(1000, 2000, badTarget),
+        null,
+      );
+    }
+
+    // 容忍 splitWideImage 与其他未知扩展字段
+    assert.strictEqual(
+      source._getReaderDisplayHeight(1000, 2000, {
+        fit: "fitWidth",
+        logicalWidth: 500,
+        devicePixelRatio: 2,
+        splitWideImage: true,
+        extraUnknownField: "tolerated",
+      }),
+      1000,
+    );
+
+    // 3. _imageHeightBucketFor：Math.round 四舍五入至 256 阶梯，clamp 256..4096，非法输入返回 null
+    assert.strictEqual(source._imageHeightBucketFor(50), 256, "极小值必须 clamp 到 256");
+    assert.strictEqual(source._imageHeightBucketFor(256), 256);
+    assert.strictEqual(source._imageHeightBucketFor(383), 256, "383 / 256 = 1.496 应四舍五入为 256");
+    assert.strictEqual(source._imageHeightBucketFor(384), 512, "384 / 256 = 1.5 应四舍五入为 512");
+    assert.strictEqual(source._imageHeightBucketFor(512), 512);
+    assert.strictEqual(source._imageHeightBucketFor(4095), 4096);
+    assert.strictEqual(source._imageHeightBucketFor(4096), 4096);
+    assert.strictEqual(source._imageHeightBucketFor(5000), 4096, "超大值必须 clamp 到 4096");
+    for (const badPixel of [0, -1, -256, NaN, Infinity, -Infinity, null, undefined, "512"]) {
+      assert.strictEqual(source._imageHeightBucketFor(badPixel), null);
+    }
+
+    // 4. _withImageHeight：URL 变动保持协议/主机/路径/全部非 height 查询文本/fragment，替换首个 height 并去重
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg", 1024),
+      "https://example.com/img.jpg?height=1024",
+    );
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?size=800x1200", 1024),
+      "https://example.com/img.jpg?size=800x1200&height=1024",
+    );
+    // 替换首个 height 且保留原有位置
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?height=500&size=800x1200", 1024),
+      "https://example.com/img.jpg?height=1024&size=800x1200",
+    );
+    // 折叠多个重复 height
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?foo=bar&height=500&baz=1&height=800", 1024),
+      "https://example.com/img.jpg?foo=bar&height=1024&baz=1",
+    );
+    // 保留原始非 height 查询参数字符串（不对其 URL 重新编码）
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?token=a%20b+c&size=800x1200", 1024),
+      "https://example.com/img.jpg?token=a%20b+c&size=800x1200&height=1024",
+    );
+    // 严格保留 fragment
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?size=800x1200#page-1", 1024),
+      "https://example.com/img.jpg?size=800x1200&height=1024#page-1",
+    );
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg#anchor", 1024),
+      "https://example.com/img.jpg?height=1024#anchor",
+    );
+    // 包含 height 子串但非 exact key 的参数被完整保留
+    assert.strictEqual(
+      source._withImageHeight("https://example.com/img.jpg?max_height=800", 1024),
+      "https://example.com/img.jpg?max_height=800&height=1024",
+    );
+    // 非 256..4096 范围或非 256 倍数的非法 height 原样返回 URL
+    for (const badH of [
+      0,
+      -1,
+      -256,
+      100,
+      255,
+      257,
+      500,
+      1023,
+      4097,
+      4352,
+      5120,
+      NaN,
+      1024.5,
+      "1024",
+      null,
+      undefined,
+    ]) {
+      assert.strictEqual(
+        source._withImageHeight("https://example.com/img.jpg?size=800x1200", badH),
+        "https://example.com/img.jpg?size=800x1200",
+        `非法 height ${badH} 必须返回原 URL`,
+      );
+    }
+  });
+
+  await test("64. comic.onImageLoad 目标尺寸集成：直连与实际 URL 适配、Target 容错降级、保留 Take=6 分批与请求头及 onThumbnailLoad 行为不变", async () => {
+    const { source } = createSourceHarness();
+
+    // 1. _applyReaderImageTarget 端到端校验
+    const baseSourceUrl = "https://example.com/img.jpg?size=1000x2000";
+    // target 为 null/undefined 时必须保留原始 URL
+    assert.strictEqual(source._applyReaderImageTarget(baseSourceUrl, null), baseSourceUrl);
+    assert.strictEqual(source._applyReaderImageTarget(baseSourceUrl, undefined), baseSourceUrl);
+
+    // 缺少可解析 size=WxH 时必须保留原始 URL（即使 fitHeight 也不改写）
+    const noSizeUrl = "https://example.com/img.jpg";
+    assert.strictEqual(
+      source._applyReaderImageTarget(noSizeUrl, {
+        fit: "fitHeight",
+        logicalHeight: 800,
+        devicePixelRatio: 2,
+      }),
+      noSizeUrl,
+    );
+
+    // contain 完整端到端：1000x2000, 视口 500x1500, DPR 2 -> 显示高 1000, 像素高 2000 -> 2000/256=7.8125 -> 8*256=2048
+    assert.strictEqual(
+      source._applyReaderImageTarget(baseSourceUrl, {
+        fit: "contain",
+        logicalWidth: 500,
+        logicalHeight: 1500,
+        devicePixelRatio: 2,
+      }),
+      "https://example.com/img.jpg?size=1000x2000&height=2048",
+    );
+
+    // fitWidth 完整端到端：1000x2000, 视口宽 400, DPR 1.5 -> 显示高 800, 像素高 1200 -> 1200/256=4.6875 -> 5*256=1280
+    assert.strictEqual(
+      source._applyReaderImageTarget(baseSourceUrl, {
+        fit: "fitWidth",
+        logicalWidth: 400,
+        devicePixelRatio: 1.5,
+      }),
+      "https://example.com/img.jpg?size=1000x2000&height=1280",
+    );
+
+    // fitHeight 完整端到端：1000x2000, 视口高 600, DPR 2 -> 显示高 600, 像素高 1200 -> 1280
+    assert.strictEqual(
+      source._applyReaderImageTarget(baseSourceUrl, {
+        fit: "fitHeight",
+        logicalHeight: 600,
+        devicePixelRatio: 2,
+      }),
+      "https://example.com/img.jpg?size=1000x2000&height=1280",
+    );
+
+    // splitWideImage 容忍性（无论 true/false 均不影响计算）
+    assert.strictEqual(
+      source._applyReaderImageTarget(baseSourceUrl, {
+        fit: "fitWidth",
+        logicalWidth: 400,
+        devicePixelRatio: 1.5,
+        splitWideImage: true,
+      }),
+      "https://example.com/img.jpg?size=1000x2000&height=1280",
+    );
+    assert.strictEqual(
+      source._applyReaderImageTarget(baseSourceUrl, {
+        fit: "fitWidth",
+        logicalWidth: 400,
+        devicePixelRatio: 1.5,
+        splitWideImage: false,
+      }),
+      "https://example.com/img.jpg?size=1000x2000&height=1280",
+    );
+
+    // 2. onImageLoad 直连 URL 路径（非 comicPageKey 引用）
+    const directUrl = "https://example.com/direct.jpg?size=1000x2000";
+    const directResNoTarget = await source.comic.onImageLoad(directUrl, "c1", 100);
+    assert.strictEqual(directResNoTarget.url, directUrl);
+    assert.strictEqual(directResNoTarget.headers["User-Agent"], source.userAgent);
+    assert.strictEqual(directResNoTarget.headers.Referer, source.siteBase + "/");
+
+    const directResWithTarget = await source.comic.onImageLoad(
+      directUrl,
+      "c1",
+      100,
+      { fit: "fitHeight", logicalHeight: 600, devicePixelRatio: 2 },
+    );
+    assert.strictEqual(
+      directResWithTarget.url,
+      "https://example.com/direct.jpg?size=1000x2000&height=1280",
+    );
+    assert.strictEqual(directResWithTarget.headers["User-Agent"], source.userAgent);
+    assert.strictEqual(directResWithTarget.headers.Referer, source.siteBase + "/");
+
+    // 3. onImageLoad 解析实际 URL 并保持 Take=6 分批及 headers
+    let capturedContentParams = null;
+    source._hubCall = async (target, params) => {
+      if (target === "GetComicContent") {
+        capturedContentParams = params;
+        return {
+          Chapter: {
+            Id: 2001,
+            BookId: 101,
+            Total: 10,
+            Skip: params.Skip,
+            Images: [
+              "https://img.example.com/ch2001/0.jpg?size=1000x2000",
+              "https://img.example.com/ch2001/1.jpg?size=1000x2000",
+              "https://img.example.com/ch2001/2.jpg?size=1000x2000",
+              "https://img.example.com/ch2001/3.jpg?size=1000x2000",
+              "https://img.example.com/ch2001/4.jpg?size=1000x2000",
+              "https://img.example.com/ch2001/5.jpg?size=1000x2000",
+            ],
+          },
+        };
+      }
+      throw new Error(`未预期的 hubCall: ${target}`);
+    };
+
+    // 请求第 2 页，附带 target
+    const page2Key = source._encodeComicPageKey(2001, 2);
+    const page2Res = await source.comic.onImageLoad(
+      page2Key,
+      "101",
+      2001,
+      { fit: "fitWidth", logicalWidth: 400, devicePixelRatio: 1.5, splitWideImage: false },
+    );
+    assert.strictEqual(capturedContentParams.Cid, 2001);
+    assert.strictEqual(capturedContentParams.Skip, 0);
+    assert.strictEqual(capturedContentParams.Take, 6, "必须保持 Take=6 分批不变");
+    assert.strictEqual(
+      page2Res.url,
+      "https://img.example.com/ch2001/2.jpg?size=1000x2000&height=1280",
+      "解析后的实际图片 URL 必须正确应用 target 自适应尺寸",
+    );
+    assert.strictEqual(page2Res.headers["User-Agent"], source.userAgent);
+    assert.strictEqual(page2Res.headers.Referer, source.siteBase + "/");
+
+    // target 为 null 时保持实际图片 URL 不变
+    const page3Key = source._encodeComicPageKey(2001, 3);
+    const page3Res = await source.comic.onImageLoad(page3Key, "101", 2001, null);
+    assert.strictEqual(
+      page3Res.url,
+      "https://img.example.com/ch2001/3.jpg?size=1000x2000",
+    );
+
+    // 4. 章节不匹配与页码越界防御行为完整保留
+    await assert.rejects(
+      async () => {
+        await source.comic.onImageLoad(
+          source._encodeComicPageKey(2001, 1),
+          "101",
+          2002, // epId 对应 chapterId 与 key 不匹配
+          { fit: "fitHeight", logicalHeight: 600, devicePixelRatio: 2 },
+        );
+      },
+      /轻书架章节图片键与当前章节不匹配/,
+    );
+
+    await assert.rejects(
+      async () => {
+        await source.comic.onImageLoad(
+          source._encodeComicPageKey(2001, 99), // 远超 Total 10
+          "101",
+          2001,
+          { fit: "fitHeight", logicalHeight: 600, devicePixelRatio: 2 },
+        );
+      },
+      /轻书架章节图片页码越界/,
+    );
+
+    // 5. onThumbnailLoad 行为完全保持不变
+    const thumbRes = source.comic.onThumbnailLoad("https://img.example.com/thumb.jpg?size=400x600");
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(thumbRes)), {
+      headers: {
+        "User-Agent": source.userAgent,
+        Referer: source.siteBase + "/",
+      },
+    });
   });
 
   assert.strictEqual(
