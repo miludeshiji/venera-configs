@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.4";
+  version = "1.0.5";
 
   minAppVersion = "1.0.0";
 
@@ -29,6 +29,40 @@ class Komiic extends ComicSource {
       headers["Authorization"] = `Bearer ${token}`;
     }
     return headers;
+  }
+
+  normalizeCover(url) {
+    if (!url || typeof url !== "string") {
+      return url;
+    }
+    try {
+      const base = new URL(this.baseUrl);
+      let parsed;
+      let isRelative = false;
+      try {
+        parsed = new URL(url);
+      } catch {
+        if (/^\/\/[^\/]/.test(url)) {
+          parsed = new URL(base.protocol + url);
+        } else {
+          parsed = new URL(url, base);
+          isRelative = true;
+        }
+      }
+
+      if (isRelative) {
+        return parsed.href;
+      }
+
+      const host = parsed.hostname.toLowerCase();
+      if (host === "komiic.com" || host === "komiic.cc") {
+        return new URL(parsed.pathname + parsed.search + parsed.hash, base).href;
+      }
+
+      return url;
+    } catch {
+      return url;
+    }
   }
 
   async queryJson(query) {
@@ -64,7 +98,7 @@ class Komiic extends ComicSource {
     let operationName = query["operationName"];
     let json = await this.queryJson(query);
 
-    function parseComic(comic) {
+    let parseComic = (comic) => {
       let author = "";
       if (comic.authors.length > 0) {
         author = comic.authors[0].name;
@@ -100,12 +134,12 @@ class Komiic extends ComicSource {
         id: comic.id,
         title: comic.title,
         subTitle: author,
-        cover: comic.imageUrl,
+        cover: this.normalizeCover(comic.imageUrl),
         tags: tags,
         description: description,
         updateTime: formatedTime,
       };
-    }
+    };
 
     return {
       comics: json.data[operationName].map(parseComic),
@@ -354,7 +388,7 @@ class Komiic extends ComicSource {
           "query searchComicAndAuthorQuery($keyword: String!) {\n  searchComicsAndAuthors(keyword: $keyword) {\n    comics {\n      id\n      title\n      status\n      year\n      imageUrl\n      authors {\n        id\n        name\n        __typename\n      }\n      categories {\n        id\n        name\n        __typename\n      }\n      dateUpdated\n      monthViews\n      views\n      favoriteCount\n      lastBookUpdate\n      lastChapterUpdate\n      __typename\n    }\n    authors {\n      id\n      name\n      chName\n      enName\n      wikiLink\n      comicCount\n      views\n      __typename\n    }\n    __typename\n  }\n}",
       });
 
-      function parseComic(comic) {
+      let parseComic = (comic) => {
         let author = "";
         if (comic.authors.length > 0) {
           author = comic.authors[0].name;
@@ -389,11 +423,11 @@ class Komiic extends ComicSource {
           id: comic.id,
           title: comic.title,
           subTitle: author,
-          cover: comic.imageUrl,
+          cover: this.normalizeCover(comic.imageUrl),
           tags: tags,
           description: description,
         };
-      }
+      };
 
       return {
         comics: json.data.searchComicsAndAuthors.comics.map(parseComic),
