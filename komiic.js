@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.6";
+  version = "1.0.7";
 
   minAppVersion = "1.0.0";
 
@@ -35,39 +35,30 @@ class Komiic extends ComicSource {
     if (!url || typeof url !== "string") {
       return url;
     }
-    try {
-      const base = new URL(this.baseUrl);
-      let parsed;
-      let isRelative = false;
-      try {
-        parsed = new URL(url);
-      } catch {
-        if (/^\/\/[^\/]/.test(url)) {
-          parsed = new URL(base.protocol + url);
-        } else {
-          parsed = new URL(url, base);
-          isRelative = true;
-        }
-      }
+    const base = (this.baseUrl || "https://komiic.com").trim().replace(/\/+$/, "");
+    const baseMatch = base.match(/^(https?:)\/\/([^\/?#]+)/i);
+    const protocol = baseMatch ? baseMatch[1] : "https:";
+    const baseHost = baseMatch ? baseMatch[2] : "komiic.com";
+    const baseDomain = baseHost.replace(/^.*?\bkomiic\./i, "komiic.");
 
-      if (isRelative) {
-        return parsed.href;
-      }
+    const komiicMatch = url.match(
+      /^(?:https?:)?\/\/(?:([a-z0-9_.-]+)\.)?komiic\.(?:com|cc)(?::\d+)?([/?#].*|$)/i,
+    );
+    if (komiicMatch) {
+      const sub = komiicMatch[1] ? `${komiicMatch[1]}.` : "";
+      const rest = komiicMatch[2] || "";
+      return `${protocol}//${sub}${baseDomain}${rest}`;
+    }
 
-      const host = parsed.hostname.toLowerCase();
-      const match = host.match(/^(?:(.+)\.)?komiic\.(?:com|cc)$/);
-      if (match) {
-        const subdomain = match[1] ? `${match[1]}.` : "";
-        return new URL(
-          parsed.pathname + parsed.search + parsed.hash,
-          `${base.protocol}//${subdomain}${base.host}`,
-        ).href;
-      }
-
-      return url;
-    } catch {
+    if (/^\/\//.test(url)) {
       return url;
     }
+
+    if (/^[^/]*:/.test(url)) {
+      return url;
+    }
+
+    return `${base}/${url.replace(/^(\.\/)+/, "").replace(/^\/+/, "")}`;
   }
 
   async queryJson(query) {
