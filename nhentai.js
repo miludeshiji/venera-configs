@@ -12,13 +12,13 @@ class Nhentai extends ComicSource {
     minAppVersion = "1.0.0"
 
     // update url
-    url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/nhentai.js"
+    url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/nhentai.js"
 
     baseUrl = "https://nhentai.net"
     apiBaseUrl = "https://nhentai.net/api/v2"
     imageServer = "https://i3.nhentai.net"
     thumbServer = "https://t3.nhentai.net"
-    apiUserAgent = "Venera/1.0 (+https://github.com/venera-app/venera)"
+    apiUserAgent = "Venera/1.0 (+https://github.com/miludeshiji/venera)"
     tagIdCache = {};
 
     settings = {
