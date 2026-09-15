@@ -80,7 +80,7 @@ class CopyManga extends ComicSource {
 
     static defaultImageQuality = "1500"
 
-    static defaultApiUrl = 'api.copy2000.online'
+    static defaultApiUrl = 'api.copy4000.com'
 
     static searchApi = "/api/kb/web/searchb/comics"
 
