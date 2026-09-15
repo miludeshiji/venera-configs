@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.5";
+  version = "1.0.6";
 
   minAppVersion = "1.0.0";
 
@@ -55,8 +55,13 @@ class Komiic extends ComicSource {
       }
 
       const host = parsed.hostname.toLowerCase();
-      if (host === "komiic.com" || host === "komiic.cc") {
-        return new URL(parsed.pathname + parsed.search + parsed.hash, base).href;
+      const match = host.match(/^(?:(.+)\.)?komiic\.(?:com|cc)$/);
+      if (match) {
+        const subdomain = match[1] ? `${match[1]}.` : "";
+        return new URL(
+          parsed.pathname + parsed.search + parsed.hash,
+          `${base.protocol}//${subdomain}${base.host}`,
+        ).href;
       }
 
       return url;
