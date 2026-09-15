@@ -4,7 +4,7 @@ class CopyManga extends ComicSource {
 
     key = "copy_manga"
 
-    version = "1.4.2"
+    version = "1.4.3"
 
     minAppVersion = "1.6.0"
 
@@ -54,13 +54,13 @@ class CopyManga extends ComicSource {
         );
 
         return {
-            "User-Agent": `COPY/3.0.6`,
+            "User-Agent": `COPY/${CopyManga.copyAppVersion}`,
             "source": "copyApp",
             "deviceinfo": this.deviceinfo,
             "dt": `${year}.${month}.${day}`,
             "platform": "3",
-            "referer": `com.copymanga.app-3.0.6`,
-            "version": "3.0.6",
+            "referer": `com.copymanga.app-${CopyManga.copyAppVersion}`,
+            "version": CopyManga.copyAppVersion,
             "device": this.device,
             "pseudoid": this.pseudoid,
             "Accept": "application/json",
@@ -72,7 +72,17 @@ class CopyManga extends ComicSource {
         };
     }
 
-    // static defaultCopyVersion = "3.0.6"
+    static copyAppVersion = "3.0.6"
+
+    static maxRateLimitWaitSeconds = 60
+
+    static maxErrorDisplayLength = 200
+
+    get imageHeaders() {
+        return {
+            "User-Agent": `COPY/${CopyManga.copyAppVersion}`,
+        };
+    }
 
     // static defaultCopyPlatform = "2"
 
@@ -885,8 +895,9 @@ class CopyManga extends ComicSource {
                     if (maxChapter > 100) {
                         let offset = 100;
                         while (offset < maxChapter) {
+                            let pageReqId = await this.getReqID();
                             res = await Network.get(
-                                `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=${offset}`,
+                                `${this.apiUrl}/api/v3/comic/${id}/group/${path}/chapters?limit=100&offset=${offset}&in_mainland=true&request_id=${pageReqId}`,
                                 this.headers
                             );
                             if (res.status !== 200) {
@@ -896,7 +907,7 @@ class CopyManga extends ComicSource {
                             data.results.list.forEach((e) => {
                                 let title = e.name;
                                 let id = e.uuid;
-                                eps.set(id, title)
+                                eps.set(id, title);
                             });
                             offset += 100;
                         }
@@ -947,7 +958,7 @@ class CopyManga extends ComicSource {
             ])
 
             if (results[0].status !== 200) {
-                throw `Invalid status code: ${res.status}`;
+                throw `Invalid status code: ${results[0].status}`;
             }
 
             let data = JSON.parse(results[0].body).results;
@@ -984,80 +995,124 @@ class CopyManga extends ComicSource {
             }
         },
         loadEp: async (comicId, epId) => {
-            let attempt = 0;
-            const maxAttempts = 5;
-            let res;
-            let data;
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                let reqId = await this.getReqID();
+                let res = await Network.get(
+                    `${this.apiUrl}/api/v3/comic/${comicId}/chapter2/${epId}?in_mainland=true&request_id=${reqId}`,
+                    {
+                        ...this.headers
+                    }
+                );
 
-            while (attempt < maxAttempts) {
-                try {
-                    let reqId = await this.getReqID();
-                    res = await Network.get(
-                        `${this.apiUrl}/api/v3/comic/${comicId}/chapter2/${epId}?in_mainland=true&request_id=${reqId}`,
-                        {
-                            ...this.headers
-                        }
-                    );
+                if (res.status === 210) {
+                    let isEmpty = !res.body || (typeof res.body === "string" && !res.body.trim());
+                    if (isEmpty) {
+                        throw `Unknown 210 response from server (empty body)`;
+                    }
 
-                    if (res.status === 210) {
-                        // 210 indicates too frequent access, extract wait time
-                        let waitTime = 40000; // Default wait time 40s
+                    let jsonParsed = false;
+                    let parsed = null;
+                    if (typeof res.body === "string") {
                         try {
-                            let responseBody = JSON.parse(res.body);
-                            if (
-                                responseBody.message &&
-                                responseBody.message.includes("Expected available in")
-                            ) {
-                                let match = responseBody.message.match(/(\d+)\s*seconds/);
-                                if (match && match[1]) {
-                                    waitTime = parseInt(match[1]) * 1000;
-                                }
-                            }
+                            parsed = JSON.parse(res.body);
+                            jsonParsed = true;
                         } catch (e) {
-                            console.log(
-                                "Unable to parse wait time, using default wait time 40s"
-                            );
+                            jsonParsed = false;
                         }
-                        console.log(`Chapter${epId} access too frequent, waiting ${waitTime / 1000}s`);
-                        await new Promise((resolve) => setTimeout(resolve, waitTime));
-                        throw "Retry";
+                    } else if (typeof res.body === "object" && res.body !== null) {
+                        parsed = res.body;
+                        jsonParsed = true;
                     }
 
-                    if (res.status !== 200) {
-                        throw `Invalid status code: ${res.status}`;
+                    if (!jsonParsed) {
+                        throw `Unknown 210 response from server (malformed response)`;
                     }
 
-                    data = JSON.parse(res.body);
-                    // console.log(data.results.chapter);
-                    // Handle image link sorting
-                    let imagesUrls = data.results.chapter.contents.map((e) => e.url);
-                    let orders = data.results.chapter.words;
-
-                    // Replace origin images urls to selected quality images urls
-                    let hdImagesUrls = imagesUrls.map((url) =>
-                        url.replace(/([./])c\d+x\.[a-zA-Z]+$/, `$1c${this.imageQuality}x.webp`)
-                    )
-
-                    let images = new Array(hdImagesUrls.length).fill(""); // Initialize an array with the same length as imagesUrls
-
-                    // Arrange images according to orders
-                    for (let i = 0; i < hdImagesUrls.length; i++) {
-                        images[orders[i]] = hdImagesUrls[i];
+                    let fullMsg = "";
+                    if (parsed && typeof parsed === "object") {
+                        if (typeof parsed.message === "string" && parsed.message.trim()) {
+                            fullMsg = parsed.message.trim();
+                        } else if (parsed.results && typeof parsed.results.detail === "string" && parsed.results.detail.trim()) {
+                            fullMsg = parsed.results.detail.trim();
+                        }
                     }
 
-                    return {
-                        images: images,
-                    };
-                } catch (error) {
-                    if (error !== "Retry") {
-                        throw error;
+                    if (!fullMsg) {
+                        throw `Unknown 210 response from server`;
                     }
-                    attempt++;
-                    if (attempt >= maxAttempts) {
-                        throw error;
+
+                    const ellipsis = "...";
+                    const displayMsg = fullMsg.length > CopyManga.maxErrorDisplayLength
+                        ? fullMsg.slice(0, Math.max(0, CopyManga.maxErrorDisplayLength - ellipsis.length)) + ellipsis
+                        : fullMsg;
+
+                    const clientRestrictionPatterns = [
+                        /更新最新\s*app/i,
+                        /破解版本/,
+                        /破解版/,
+                        /正版/,
+                        /等待1小時/,
+                        /等待1小时/
+                    ];
+                    if (clientRestrictionPatterns.some(pattern => pattern.test(fullMsg))) {
+                        throw `Client restriction: ${displayMsg}`;
                     }
+
+                    const rateLimitMatch = fullMsg.match(/Expected available in\s+(\d+)\s+seconds/i);
+                    if (rateLimitMatch) {
+                        const seconds = parseInt(rateLimitMatch[1], 10);
+                        if (seconds > CopyManga.maxRateLimitWaitSeconds) {
+                            throw `Rate limit too long (${seconds} seconds): ${displayMsg}`;
+                        }
+                        if (seconds >= 1 && seconds <= CopyManga.maxRateLimitWaitSeconds) {
+                            if (attempt < maxAttempts) {
+                                await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+                                continue;
+                            } else {
+                                throw `Rate limit retry exhausted after ${maxAttempts} attempts: ${displayMsg}`;
+                            }
+                        }
+                    }
+
+                    throw `Unknown 210 response: ${displayMsg}`;
                 }
+
+                if (res.status !== 200) {
+                    throw `Invalid status code: ${res.status}`;
+                }
+
+                let data = JSON.parse(res.body);
+                // Handle image link sorting
+                let imagesUrls = data.results.chapter.contents.map((e) => e.url);
+                let orders = data.results.chapter.words;
+
+                // Replace origin images urls to selected quality images urls
+                let hdImagesUrls = imagesUrls.map((url) =>
+                    url.replace(/([./])c\d+x\.[a-zA-Z]+$/, `$1c${this.imageQuality}x.webp`)
+                )
+
+                let images = new Array(hdImagesUrls.length).fill(""); // Initialize an array with the same length as imagesUrls
+
+                // Arrange images according to orders
+                for (let i = 0; i < hdImagesUrls.length; i++) {
+                    images[orders[i]] = hdImagesUrls[i];
+                }
+
+                return {
+                    images: images,
+                };
             }
+        },
+        onImageLoad: (url, comicId, epId) => {
+            return {
+                headers: this.imageHeaders,
+            };
+        },
+        onThumbnailLoad: (url) => {
+            return {
+                headers: this.imageHeaders,
+            };
         },
         loadComments: async (comicId, subId, page, replyTo) => {
             let url = `${this.apiUrl}/api/v3/comments?comic_id=${subId}&limit=20&offset=${(page - 1) * 20}`;
@@ -1112,8 +1167,7 @@ class CopyManga extends ComicSource {
             );
 
             if (res.status === 401) {
-                error(`Login expired`);
-                return;
+                throw `Login expired`;
             }
 
             if (res.status !== 200) {
@@ -1299,9 +1353,9 @@ class CopyManga extends ComicSource {
             default: CopyManga.defaultApiUrl,
         },
         clear_device_info: {
-            title: "清除设备信息",
+            title: "清除设备信息（将更换设备身份，可能影响登录状态）",
             type: "callback",
-            buttonText: "点击清除设备信息",
+            buttonText: "清除信息",
             callback: () => {
                 this.deleteData("_deviceinfo");
                 this.deleteData("_device");

@@ -1096,7 +1096,7 @@ class CopyManga extends ComicSource {
         clear_device_info: {
             title: "清除设备信息（将更换设备身份，可能影响登录状态）",
             type: "callback",
-            buttonText: "清除设备",
+            buttonText: "清除信息",
             callback: () => {
                 this.deleteData("_deviceinfo");
                 this.deleteData("_device");
