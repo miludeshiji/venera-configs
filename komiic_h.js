@@ -5,12 +5,12 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "KomiicH";
 
-  version = "0.0.2";
+  version = "1.0.0";
 
   minAppVersion = "1.0.0";
 
   // 更新链接
-  url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/komiicH.js";
+  url = "https://cdn.jsdelivr.net/gh/miludeshiji/venera-configs@main/komiic_h.js";
 
   // 可选访问域名，默认主站
   get baseUrl() {
@@ -68,9 +68,17 @@ class Komiic extends ComicSource {
 
     let targets;
     try {
-      targets = this.loadData("tagTargetIds");
+      targets = this.loadData("tagTargetIdsV2");
     } catch (e) {
       targets = {};
+    }
+
+    if (typeof targets === "string") {
+      try {
+        targets = JSON.parse(targets);
+      } catch (e) {
+        targets = {};
+      }
     }
 
     if (!targets || typeof targets !== "object" || Array.isArray(targets)) {
@@ -81,24 +89,40 @@ class Komiic extends ComicSource {
 
     const save = (namespace, name, type, id) => {
       if (
+        typeof namespace !== "string" ||
         typeof name !== "string" ||
-        name.trim().length === 0 ||
+        typeof type !== "string" ||
         id === null ||
         id === undefined
       ) {
         return;
       }
 
+      const normNamespace = namespace.trim();
+      const normName = name.trim();
+      const normType = type.trim();
       const idStr = String(id).trim();
-      if (idStr.length === 0) {
+
+      if (
+        normNamespace.length === 0 ||
+        normName.length === 0 ||
+        normType.length === 0 ||
+        idStr.length === 0
+      ) {
         return;
       }
 
-      const key = `${namespace}\u0000${name}`;
-      const value = `${type}\u0000${idStr}`;
+      const key = JSON.stringify([normNamespace, normName]);
+      const current = targets[key];
 
-      if (targets[key] !== value) {
-        targets[key] = value;
+      if (
+        !current ||
+        typeof current !== "object" ||
+        Array.isArray(current) ||
+        current.type !== normType ||
+        current.id !== idStr
+      ) {
+        targets[key] = { type: normType, id: idStr };
         changed = true;
       }
     };
@@ -121,7 +145,7 @@ class Komiic extends ComicSource {
 
     if (changed) {
       try {
-        this.saveData("tagTargetIds", targets);
+        this.saveData("tagTargetIdsV2", targets);
       } catch (e) {
         // ignore storage errors
       }
@@ -133,39 +157,56 @@ class Komiic extends ComicSource {
       return null;
     }
 
+    const normNamespace = namespace.trim();
+    const normTag = tag.trim();
+    if (normNamespace.length === 0 || normTag.length === 0) {
+      return null;
+    }
+
     let targets;
     try {
-      targets = this.loadData("tagTargetIds");
+      targets = this.loadData("tagTargetIdsV2");
     } catch (e) {
       return null;
+    }
+
+    if (typeof targets === "string") {
+      try {
+        targets = JSON.parse(targets);
+      } catch (e) {
+        return null;
+      }
     }
 
     if (!targets || typeof targets !== "object" || Array.isArray(targets)) {
       return null;
     }
 
-    const value = targets[`${namespace}\u0000${tag}`];
-    if (typeof value !== "string") {
+    const key = JSON.stringify([normNamespace, normTag]);
+    const target = targets[key];
+    if (!target || typeof target !== "object" || Array.isArray(target)) {
       return null;
     }
 
-    const separator = value.indexOf("\u0000");
-    if (separator <= 0) {
+    const type = typeof target.type === "string" ? target.type.trim() : "";
+    const id =
+      target.id !== null && target.id !== undefined
+        ? String(target.id).trim()
+        : "";
+    if (type.length === 0 || id.length === 0) {
       return null;
     }
 
-    const type = value.substring(0, separator);
-    const id = value.substring(separator + 1).trim();
-    if (!id) {
+    try {
+      if (type === "author") {
+        return `${this.baseUrl}/author/${encodeURIComponent(id)}`;
+      }
+
+      if (type === "category") {
+        return `${this.baseUrl}/comics/category/${encodeURIComponent(id)}`;
+      }
+    } catch (e) {
       return null;
-    }
-
-    if (type === "author") {
-      return `${this.baseUrl}/author/${encodeURIComponent(id)}`;
-    }
-
-    if (type === "category") {
-      return `${this.baseUrl}/comics/category/${encodeURIComponent(id)}`;
     }
 
     return null;
