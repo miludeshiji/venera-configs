@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.8";
+  version = "1.0.9";
 
   minAppVersion = "1.0.0";
 
@@ -545,14 +545,24 @@ class Komiic extends ComicSource {
   comic = {
     // 加载漫画信息
     loadInfo: async (id) => {
-      let json1 = await this.queryJson({
-        operationName: "recommendComicById",
-        variables: { comicId: id },
-        query:
-          "query recommendComicById($comicId: ID!) {\n  recommendComicById(comicId: $comicId)\n}",
-      });
-      let recommend = json1.data.recommendComicById;
-      recommend.push(id);
+      let getRecommend = async () => {
+        let json = await this.queryJson({
+          operationName: "recommendComicById",
+          variables: { comicId: id },
+          query:
+            "query recommendComicById($comicId: ID!) {\n  recommendComicById(comicId: $comicId)\n}",
+        });
+        let recommend = (json && json.data && json.data.recommendComicById) || [];
+        if (!Array.isArray(recommend) || recommend.length === 0) {
+          return { comics: [], maxPage: 1 };
+        }
+        return this.queryComics({
+          operationName: "comicByIds",
+          variables: { comicIds: recommend },
+          query:
+            "query comicByIds($comicIds: [ID]!) {\n  comicByIds(comicIds: $comicIds) {\n    id\n    title\n    status\n    year\n    imageUrl\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    dateUpdated\n    monthViews\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}",
+        });
+      };
 
       let getChapter = async () => {
         let json = await this.queryJson({
@@ -561,7 +571,7 @@ class Komiic extends ComicSource {
           query:
             "query chapterByComicId($comicId: ID!) {\n  chaptersByComicId(comicId: $comicId) {\n    id\n    serial\n    type\n    dateCreated\n    dateUpdated\n    size\n    __typename\n  }\n}",
         });
-        let all = json.data.chaptersByComicId;
+        let all = (json && json.data && json.data.chaptersByComicId) || [];
         let books = [],
           chapters = [];
         all.forEach((c) => {
@@ -583,33 +593,73 @@ class Komiic extends ComicSource {
         return res;
       };
 
-      let results = await Promise.all([
-        this.queryComics({
-          operationName: "comicByIds",
-          variables: { comicIds: recommend },
+      let getInfo = async () => {
+        let json = await this.queryJson({
+          operationName: "comicById",
+          variables: { comicId: id },
           query:
-            "query comicByIds($comicIds: [ID]!) {\n  comicByIds(comicIds: $comicIds) {\n    id\n    title\n    status\n    year\n    imageUrl\n    description\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    dateUpdated\n    monthViews\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}",
-        }),
-        getChapter.call(),
+            "query comicById($comicId: ID!) {\n  comicById(comicId: $comicId) {\n    id\n    title\n    description\n    status\n    year\n    imageUrl\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    warnings\n    dateCreated\n    dateUpdated\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}",
+        });
+        return json.data.comicById;
+      };
+
+      let [recommendRes, chaptersRes, info] = await Promise.all([
+        getRecommend(),
+        getChapter(),
+        getInfo(),
       ]);
 
-      let info = results[0].comics.pop();
+      info = info || {};
+
+      let authors = [];
+      if (Array.isArray(info.authors)) {
+        authors = info.authors
+          .map((a) => (typeof a === "string" ? a : a?.name))
+          .filter((name) => typeof name === "string" && name.trim().length > 0);
+      }
+
+      let categories = [];
+      if (Array.isArray(info.categories)) {
+        categories = info.categories
+          .map((c) => (typeof c === "string" ? c : c?.name))
+          .filter((name) => typeof name === "string" && name.trim().length > 0);
+      }
+
+      let warnings = [];
+      if (Array.isArray(info.warnings)) {
+        warnings = info.warnings
+          .map((w) => (typeof w === "string" ? w : w?.name))
+          .filter((name) => typeof name === "string" && name.trim().length > 0);
+      }
+
+      let tags = {
+        作者: authors,
+        标签: categories,
+      };
+      if (warnings.length > 0) {
+        tags["内容警告"] = warnings;
+      }
+
+      let updateTime = "";
+      if (info.dateUpdated) {
+        let d = new Date(info.dateUpdated);
+        if (!isNaN(d.getTime())) {
+          updateTime = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+        }
+      }
 
       return {
         // string 标题
         title: info.title,
         // string 封面url
-        cover: info.cover,
-        description: info.intro || "",
+        cover: this.normalizeCover(info.imageUrl),
+        description: info.description || "",
         // map<string, string[]> 标签
-        tags: {
-          作者: [info.subTitle],
-          标签: info.tags,
-        },
+        tags: tags,
         // map<string, string>?, key为章节id, value为章节名称
-        chapters: results[1],
-        recommend: results[0].comics,
-        updateTime: info.updateTime,
+        chapters: chaptersRes,
+        recommend: (recommendRes && recommendRes.comics) || [],
+        updateTime: updateTime,
       };
     },
     // 获取章节图片
