@@ -18,6 +18,12 @@
         "version": "1.0.10"
     },
     {
+        "name": "KomiicH",
+        "fileName": "komiic_h.js",
+        "key": "KomiicH",
+        "version": "0.0.1"
+    },
+    {
         "name": "包子漫画",
         "fileName": "baozi.js",
         "key": "baozi",
