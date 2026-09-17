@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "KomiicH";
 
-  version = "0.0.1";
+  version = "0.0.2";
 
   minAppVersion = "1.0.0";
 
@@ -38,8 +38,8 @@ class Komiic extends ComicSource {
     const base = (this.baseUrl || "https://h.komiic.com").trim().replace(/\/+$/, "");
     const baseMatch = base.match(/^(https?:)\/\/([^\/?#]+)/i);
     const protocol = baseMatch ? baseMatch[1] : "https:";
-    const baseHost = baseMatch ? baseMatch[2] : "h.komiic.com";
-    const baseDomain = baseHost.replace(/^.*?\bh.komiic\./i, "h.komiic.");
+    const baseHost = baseMatch ? baseMatch[2] : "komiic.com";
+    const baseDomain = baseHost.replace(/^.*?\bkomiic\./i, "komiic.");
 
     const komiicMatch = url.match(
       /^(?:https?:)?\/\/(?:([a-z0-9_.-]+)\.)?komiic\.(?:com|cc)(?::\d+)?([/?#].*|$)/i,
