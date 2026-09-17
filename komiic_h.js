@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "KomiicH";
 
-  version = "1.2.0";
+  version = "1.2.1";
 
   minAppVersion = "1.0.0";
 
@@ -17,8 +17,178 @@ class Komiic extends ComicSource {
     return this.loadSetting("domain") || "https://h.komiic.com";
   }
 
+  loadSharedData(dataKey) {
+    if (typeof sendMessage === "function") {
+      return sendMessage({
+        method: "load_data",
+        key: "Komiic",
+        data_key: dataKey,
+      });
+    }
+    return null;
+  }
+
+  saveSharedData(dataKey, data) {
+    if (typeof sendMessage === "function") {
+      return sendMessage({
+        method: "save_data",
+        key: "Komiic",
+        data_key: dataKey,
+        data: data,
+      });
+    }
+    throw "sendMessage is not available";
+  }
+
+  deleteSharedData(dataKey) {
+    if (typeof sendMessage === "function") {
+      return sendMessage({
+        method: "delete_data",
+        key: "Komiic",
+        data_key: dataKey,
+      });
+    }
+    return null;
+  }
+
+  isValidToken(token) {
+    return typeof token === "string" && token.trim().length > 0;
+  }
+
+  validateCredentials(raw) {
+    if (Array.isArray(raw) && raw.length >= 2) {
+      const user = typeof raw[0] === "string" ? raw[0].trim() : "";
+      const pass = typeof raw[1] === "string" ? raw[1] : "";
+      if (user.length > 0 && pass.length > 0) {
+        return [user, pass];
+      }
+    } else if (raw && typeof raw === "object") {
+      const user =
+        typeof (raw.account || raw.email || raw.username) === "string"
+          ? (raw.account || raw.email || raw.username).trim()
+          : "";
+      const pass =
+        typeof (raw.pwd || raw.password) === "string"
+          ? (raw.pwd || raw.password)
+          : "";
+      if (user.length > 0 && pass.length > 0) {
+        return [user, pass];
+      }
+    }
+    return null;
+  }
+
+  isValidAccount(account) {
+    return this.validateCredentials(account) !== null;
+  }
+
+  loadAuthData(field) {
+    if (field !== "token" && field !== "account") {
+      return null;
+    }
+
+    // 1. Prefer shared owner storage (Komiic)
+    let sharedVal = null;
+    try {
+      sharedVal = this.loadSharedData(field);
+    } catch (e) {
+      sharedVal = null;
+    }
+    const isSharedValid =
+      field === "token"
+        ? this.isValidToken(sharedVal)
+        : this.isValidAccount(sharedVal);
+    if (isSharedValid) {
+      return sharedVal;
+    }
+
+    // 2. Fall back to local legacy storage
+    let localVal = null;
+    try {
+      localVal = this.loadData(field);
+    } catch (e) {
+      localVal = null;
+    }
+    const isLocalValid =
+      field === "token"
+        ? this.isValidToken(localVal)
+        : this.isValidAccount(localVal);
+    if (isLocalValid) {
+      // Idempotent migration: copy valid local auth to shared storage
+      try {
+        this.saveSharedData(field, localVal);
+      } catch (e) {}
+      return localVal;
+    }
+
+    return null;
+  }
+
+  saveAuthData(token, accountData) {
+    let savedShared = false;
+    try {
+      this.saveSharedData("token", token);
+      this.saveSharedData("account", accountData);
+      savedShared = true;
+    } catch (e) {
+      savedShared = false;
+    }
+
+    let savedLocal = false;
+    if (!savedShared) {
+      try {
+        this.saveData("token", token);
+        this.saveData("account", accountData);
+        savedLocal = true;
+      } catch (e) {
+        savedLocal = false;
+      }
+    }
+
+    if (!savedShared && !savedLocal) {
+      throw "Failed to save login credentials";
+    }
+    return true;
+  }
+
+  clearAuthData() {
+    // Clear shared owner data where possible
+    try {
+      this.deleteSharedData("token");
+    } catch (e) {}
+    try {
+      this.deleteSharedData("account");
+    } catch (e) {}
+
+    // Clear local compatibility data
+    try {
+      this.deleteData("token");
+    } catch (e) {}
+    try {
+      this.deleteData("account");
+    } catch (e) {}
+  }
+
+  getAuthToken() {
+    try {
+      let token = this.loadAuthData("token");
+      return this.isValidToken(token) ? token.trim() : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  getAccountCredentials() {
+    try {
+      let raw = this.loadAuthData("account");
+      return this.validateCredentials(raw);
+    } catch (e) {
+      return null;
+    }
+  }
+
   get headers() {
-    let token = this.loadData("token");
+    let token = this.getAuthToken();
     let headers = {
       Referer: this.baseUrl + "/",
       "User-Agent":
@@ -267,7 +437,7 @@ class Komiic extends ComicSource {
     };
   }
 
-  async queryJson(query) {
+  async queryJson(query, isRetry = false) {
     let res = await Network.post(
       this.baseUrl + "/api/query",
       this.headers,
@@ -281,14 +451,20 @@ class Komiic extends ComicSource {
     let json = JSON.parse(res.body);
 
     if (json.errors != undefined) {
-      const errorInfo = json.errors[0].message.toString();
+      const errorInfo =
+        json.errors[0] && json.errors[0].message != null
+          ? json.errors[0].message.toString()
+          : "";
       if (
-        errorInfo.indexOf("token is expired") >= 0 ||
-        errorInfo.indexOf("no token") >= 0
+        !isRetry &&
+        (errorInfo.indexOf("token is expired") >= 0 ||
+          errorInfo.indexOf("no token") >= 0)
       ) {
-        const accountData = this.loadData("account");
-        await this.account.login(accountData[0], accountData[1]);
-        return await this.queryJson(query);
+        const credentials = this.getAccountCredentials();
+        if (credentials) {
+          await this.account.login(credentials[0], credentials[1]);
+          return await this.queryJson(query, true);
+        }
       }
       throw json.errors[0].message;
     }
@@ -392,22 +568,45 @@ class Komiic extends ComicSource {
     /// 登录
     /// 返回任意值表示登录成功
     login: async (account, pwd) => {
+      if (
+        !account ||
+        typeof account !== "string" ||
+        !account.trim() ||
+        !pwd ||
+        typeof pwd !== "string"
+      ) {
+        throw "Invalid account or password";
+      }
+
       let res = await Network.post(this.baseUrl + "/api/login", this.headers, {
         email: account,
         password: pwd,
       });
 
-      if (res.status === 200) {
-        this.saveData("token", JSON.parse(res.body).token);
-        return "ok";
+      if (res.status !== 200) {
+        throw `Invalid Status Code ${res.status}`;
       }
 
-      throw "Failed to login";
+      let json;
+      try {
+        json = JSON.parse(res.body);
+      } catch (e) {
+        throw "Failed to parse login response";
+      }
+
+      let token =
+        json && typeof json.token === "string" ? json.token.trim() : null;
+      if (!token) {
+        throw "Failed to login: invalid token";
+      }
+
+      this.saveAuthData(token, [account, pwd]);
+      return "ok";
     },
 
     // 退出登录时将会调用此函数
     logout: () => {
-      this.deleteData("token");
+      this.clearAuthData();
     },
 
     registerWebsite: "https://h.komiic.com/register",
