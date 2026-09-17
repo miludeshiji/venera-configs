@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.7";
+  version = "1.0.8";
 
   minAppVersion = "1.0.0";
 
@@ -133,6 +133,7 @@ class Komiic extends ComicSource {
         cover: this.normalizeCover(comic.imageUrl),
         tags: tags,
         description: description,
+        intro: comic.description || "",
         updateTime: formatedTime,
       };
     };
@@ -587,7 +588,7 @@ class Komiic extends ComicSource {
           operationName: "comicByIds",
           variables: { comicIds: recommend },
           query:
-            "query comicByIds($comicIds: [ID]!) {\n  comicByIds(comicIds: $comicIds) {\n    id\n    title\n    status\n    year\n    imageUrl\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    dateUpdated\n    monthViews\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}",
+            "query comicByIds($comicIds: [ID]!) {\n  comicByIds(comicIds: $comicIds) {\n    id\n    title\n    status\n    year\n    imageUrl\n    description\n    authors {\n      id\n      name\n      __typename\n    }\n    categories {\n      id\n      name\n      __typename\n    }\n    dateUpdated\n    monthViews\n    views\n    favoriteCount\n    lastBookUpdate\n    lastChapterUpdate\n    __typename\n  }\n}",
         }),
         getChapter.call(),
       ]);
@@ -599,6 +600,7 @@ class Komiic extends ComicSource {
         title: info.title,
         // string 封面url
         cover: info.cover,
+        description: info.intro || "",
         // map<string, string[]> 标签
         tags: {
           作者: [info.subTitle],
