@@ -1158,7 +1158,7 @@ class Komiic extends ComicSource {
         { value: "https://komiic.com", text: "主站 (komiic.com)" },
         {
           value: "https://komiic.cc",
-          text: "中国大陆线路 (komiic.cc，速度更稳定)",
+          text: "大陆线路 (komiic.cc)",
         },
       ],
       default: "https://komiic.com",

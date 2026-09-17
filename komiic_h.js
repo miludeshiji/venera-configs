@@ -1242,7 +1242,7 @@ class Komiic extends ComicSource {
         { value: "https://h.komiic.com", text: "主站 (h.komiic.com)" },
         {
           value: "https://h.komiic.cc",
-          text: "中国大陆线路 (h.komiic.cc，速度更稳定)",
+          text: "大陆线路 (h.komiic.cc)",
         },
       ],
       default: "https://h.komiic.com",
