@@ -5,7 +5,7 @@ class Komiic extends ComicSource {
   // 唯一标识符
   key = "Komiic";
 
-  version = "1.0.9";
+  version = "1.0.10";
 
   minAppVersion = "1.0.0";
 
@@ -59,6 +59,116 @@ class Komiic extends ComicSource {
     }
 
     return `${base}/${url.replace(/^(\.\/)+/, "").replace(/^\/+/, "")}`;
+  }
+
+  rememberTagTargets(info) {
+    if (!info || typeof info !== "object") {
+      return;
+    }
+
+    let targets;
+    try {
+      targets = this.loadData("tagTargetIds");
+    } catch (e) {
+      targets = {};
+    }
+
+    if (!targets || typeof targets !== "object" || Array.isArray(targets)) {
+      targets = {};
+    }
+
+    let changed = false;
+
+    const save = (namespace, name, type, id) => {
+      if (
+        typeof name !== "string" ||
+        name.trim().length === 0 ||
+        id === null ||
+        id === undefined
+      ) {
+        return;
+      }
+
+      const idStr = String(id).trim();
+      if (idStr.length === 0) {
+        return;
+      }
+
+      const key = `${namespace}\u0000${name}`;
+      const value = `${type}\u0000${idStr}`;
+
+      if (targets[key] !== value) {
+        targets[key] = value;
+        changed = true;
+      }
+    };
+
+    if (Array.isArray(info.authors)) {
+      info.authors.forEach((author) => {
+        if (author && typeof author === "object") {
+          save("作者", author.name, "author", author.id);
+        }
+      });
+    }
+
+    if (Array.isArray(info.categories)) {
+      info.categories.forEach((category) => {
+        if (category && typeof category === "object") {
+          save("标签", category.name, "category", category.id);
+        }
+      });
+    }
+
+    if (changed) {
+      try {
+        this.saveData("tagTargetIds", targets);
+      } catch (e) {
+        // ignore storage errors
+      }
+    }
+  }
+
+  getTagTargetUrl(namespace, tag) {
+    if (typeof namespace !== "string" || typeof tag !== "string") {
+      return null;
+    }
+
+    let targets;
+    try {
+      targets = this.loadData("tagTargetIds");
+    } catch (e) {
+      return null;
+    }
+
+    if (!targets || typeof targets !== "object" || Array.isArray(targets)) {
+      return null;
+    }
+
+    const value = targets[`${namespace}\u0000${tag}`];
+    if (typeof value !== "string") {
+      return null;
+    }
+
+    const separator = value.indexOf("\u0000");
+    if (separator <= 0) {
+      return null;
+    }
+
+    const type = value.substring(0, separator);
+    const id = value.substring(separator + 1).trim();
+    if (!id) {
+      return null;
+    }
+
+    if (type === "author") {
+      return `${this.baseUrl}/author/${encodeURIComponent(id)}`;
+    }
+
+    if (type === "category") {
+      return `${this.baseUrl}/comics/category/${encodeURIComponent(id)}`;
+    }
+
+    return null;
   }
 
   async queryJson(query) {
@@ -611,6 +721,8 @@ class Komiic extends ComicSource {
 
       info = info || {};
 
+      this.rememberTagTargets(info);
+
       let authors = [];
       if (Array.isArray(info.authors)) {
         authors = info.authors
@@ -745,6 +857,18 @@ class Komiic extends ComicSource {
           "mutation addMessageToComic($comicId: ID!, $replyToId: ID!, $message: String!) {\n  addMessageToComic(message: $message, comicId: $comicId, replyToId: $replyToId) {\n    id\n    message\n    comicId\n    account {\n      id\n      nickname\n      __typename\n    }\n    replyTo {\n      id\n      message\n      account {\n        id\n        nickname\n        profileText\n        profileTextColor\n        profileBackgroundColor\n        profileImageUrl\n        __typename\n      }\n      __typename\n    }\n    dateCreated\n    dateUpdated\n    __typename\n  }\n}",
       });
       return "ok";
+    },
+    onClickTag: (namespace, tag) => {
+      const url = this.getTagTargetUrl(namespace, tag);
+      if (!url) {
+        return null;
+      }
+      return {
+        page: "url",
+        attributes: {
+          url: url,
+        },
+      };
     },
   };
 
